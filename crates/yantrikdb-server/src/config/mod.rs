@@ -569,6 +569,11 @@ impl ServerConfig {
             );
         }
         let config: ServerConfig = toml::from_str(&content)?;
+        // Cross-field semantics fail at load, not at first use, so
+        // every subcommand sharing the file reports the same problem
+        // at startup (run_server re-checks for programmatically built
+        // configs that never passed through here).
+        config.embedding.validate()?;
         Ok(config)
     }
 
@@ -796,5 +801,28 @@ model_dir = "/models/minilm-multilingual"
                 "unset model_dir must not constrain strategy"
             );
         }
+    }
+
+    /// `ServerConfig::load` must surface the model_dir/strategy clash
+    /// at load time — every subcommand sharing the config file fails
+    /// identically at startup instead of only `serve` at boot.
+    #[test]
+    fn load_rejects_model_dir_with_non_builtin_strategy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.toml");
+        std::fs::write(
+            &path,
+            r#"[embedding]
+strategy = "client_only"
+dim = 384
+model_dir = "/models/minilm-multilingual"
+"#,
+        )
+        .unwrap();
+        let err = ServerConfig::load(&path).expect_err("must be refused at load");
+        assert!(
+            err.to_string().contains("model_dir"),
+            "error should name the offending field, got: {err}"
+        );
     }
 }
