@@ -1611,49 +1611,81 @@ async fn remember_batch(
         return Ok(Json(json!({"rids": [], "count": 0})));
     }
 
-    // Quota checks: batch size + total memory count
+    check_batch_quotas(&state, db_id, &engine, memories_arr.len())?;
+
+    let batch_key: Option<String> = body
+        .get("idempotency_key")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let (mut memories, item_keys) = parse_batch_items(memories_arr, batch_key.as_deref())?;
+
+    preembed_missing(&state, &mut memories).await?;
+
+    // Issue #58: any key present routes the WHOLE batch through the
+    // engine's atomic batch path (claims + rows in one transaction,
+    // all-or-nothing on conflict — the embedded semantics mcp/hermes
+    // locked). Mixed keyed/unkeyed items ride together; unkeyed items
+    // simply carry no claim.
+    if item_keys.iter().any(|k| k.is_some()) {
+        return remember_batch_with_idempotency(&state, engine, memories, item_keys).await;
+    }
+
+    commit_unkeyed_batch(&state, db_id, engine, memories).await
+}
+
+/// Quota gates for /v1/remember/batch, cheapest first: the
+/// per-database batch-size quota (429), then the total memory-count
+/// quota, then the hard protocol cap of 10_000 items per batch.
+fn check_batch_quotas(
+    state: &AppState,
+    db_id: i64,
+    engine: &EngineHandle,
+    batch_len: usize,
+) -> Result<(), AppError> {
     let quota = {
         let ctrl = state.control.lock();
         ctrl.get_quota(db_id).unwrap_or_default()
     };
 
-    if memories_arr.len() > quota.max_batch_size as usize {
+    if batch_len > quota.max_batch_size as usize {
         return Err(app_error(
             StatusCode::TOO_MANY_REQUESTS,
             format!(
                 "batch size {} exceeds quota {} for this database",
-                memories_arr.len(),
-                quota.max_batch_size
+                batch_len, quota.max_batch_size
             ),
         ));
     }
 
-    check_memory_quota(&state, db_id, &engine, memories_arr.len())?;
+    check_memory_quota(state, db_id, engine, batch_len)?;
 
-    if memories_arr.len() > 10_000 {
+    if batch_len > 10_000 {
         return Err(app_error(
             StatusCode::BAD_REQUEST,
             "batch size exceeds 10000",
         ));
     }
+    Ok(())
+}
 
+/// Parse the `memories` array into [`RememberInput`]s plus the
+/// positionally aligned idempotency keys (Issue #58). A batch-level key
+/// derives per-item as "{key}:{index}" — the convention yantrikdb-mcp
+/// and yantrikdb-hermes-plugin already shipped; mirroring it means
+/// retries dedupe identically across all three surfaces. An explicit
+/// per-item key wins over the derivation.
+fn parse_batch_items(
+    memories_arr: &[Value],
+    batch_key: Option<&str>,
+) -> Result<(Vec<crate::command::RememberInput>, Vec<Option<String>>), AppError> {
     let mut memories = Vec::with_capacity(memories_arr.len());
-    // Issue #58: per-item idempotency keys, positionally aligned with
-    // `memories`. A batch-level key derives per-item as "{key}:{index}" —
-    // the convention yantrikdb-mcp and yantrikdb-hermes-plugin already
-    // shipped; mirroring it means retries dedupe identically across all
-    // three surfaces. An explicit per-item key wins over the derivation.
     let mut item_keys: Vec<Option<String>> = Vec::with_capacity(memories_arr.len());
-    let batch_key: Option<String> = body
-        .get("idempotency_key")
-        .and_then(|v| v.as_str())
-        .map(String::from);
     for (i, m) in memories_arr.iter().enumerate() {
         item_keys.push(
             m.get("idempotency_key")
                 .and_then(|v| v.as_str())
                 .map(String::from)
-                .or_else(|| batch_key.as_ref().map(|k| format!("{k}:{i}"))),
+                .or_else(|| batch_key.map(|k| format!("{k}:{i}"))),
         );
         let text = m
             .get("text")
@@ -1708,79 +1740,90 @@ async fn remember_batch(
             created_at: m.get("created_at").and_then(|v| v.as_f64()),
         });
     }
+    Ok((memories, item_keys))
+}
 
-    // Issue #19: pre-embed any memory that didn't ship with a
-    // client-supplied embedding. Batch the misses through one
-    // `embed_batch` call so concurrent ONNX-mutex acquisitions are
-    // coalesced (the embedder cache + batch path was wired in
-    // commit `e52228e`). On embedder failure we return 5xx and the
-    // entire batch is rejected — partial success would land
-    // NULL-embedding rows in the engine and re-create the bug.
-    if let Some(embedder) = state.pool.embedder().cloned() {
-        let needs_embed: Vec<usize> = memories
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.embedding.is_none())
-            .map(|(i, _)| i)
-            .collect();
-        if !needs_embed.is_empty() {
-            let texts: Vec<String> = needs_embed
-                .iter()
-                .map(|&i| memories[i].text.clone())
-                .collect();
-            let result = tokio::task::spawn_blocking(move || {
-                use yantrikdb::types::Embedder;
-                let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-                embedder.embed_batch(&refs)
-            })
-            .await
-            .map_err(|e| {
-                app_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("embed batch task panicked: {}", e),
-                )
-            })?;
-            match result {
-                Ok(embeddings) => {
-                    for (idx, vec) in needs_embed.iter().zip(embeddings.into_iter()) {
-                        memories[*idx].embedding = Some(vec);
-                    }
-                }
-                Err(e) => {
-                    crate::metrics::increment_embedder_failure("remember_batch");
-                    tracing::error!(
-                        error = %e,
-                        miss_count = needs_embed.len(),
-                        batch_size = memories.len(),
-                        "embedder failed during /v1/remember/batch; refusing partial-NULL write"
-                    );
-                    return Err(app_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!(
-                            "embedder failed: {} (issue #19 — batch refused to prevent NULL-embedding rows; please retry)",
-                            e
-                        ),
-                    ));
-                }
+/// Issue #19: pre-embed any memory that didn't ship with a
+/// client-supplied embedding. Batch the misses through one
+/// `embed_batch` call so concurrent ONNX-mutex acquisitions are
+/// coalesced (the embedder cache + batch path was wired in commit
+/// `e52228e`). On embedder failure we return 5xx and the entire batch
+/// is rejected — partial success would land NULL-embedding rows in
+/// the engine and re-create the bug.
+async fn preembed_missing(
+    state: &Arc<AppState>,
+    memories: &mut [crate::command::RememberInput],
+) -> Result<(), AppError> {
+    let Some(embedder) = state.pool.embedder().cloned() else {
+        return Ok(());
+    };
+    let needs_embed: Vec<usize> = memories
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.embedding.is_none())
+        .map(|(i, _)| i)
+        .collect();
+    if needs_embed.is_empty() {
+        return Ok(());
+    }
+    let texts: Vec<String> = needs_embed
+        .iter()
+        .map(|&i| memories[i].text.clone())
+        .collect();
+    let result = tokio::task::spawn_blocking(move || {
+        use yantrikdb::types::Embedder;
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        embedder.embed_batch(&refs)
+    })
+    .await
+    .map_err(|e| {
+        app_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("embed batch task panicked: {}", e),
+        )
+    })?;
+    match result {
+        Ok(embeddings) => {
+            for (idx, vec) in needs_embed.iter().zip(embeddings.into_iter()) {
+                memories[*idx].embedding = Some(vec);
             }
+            Ok(())
+        }
+        Err(e) => {
+            crate::metrics::increment_embedder_failure("remember_batch");
+            tracing::error!(
+                error = %e,
+                miss_count = needs_embed.len(),
+                batch_size = memories.len(),
+                "embedder failed during /v1/remember/batch; refusing partial-NULL write"
+            );
+            Err(app_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "embedder failed: {} (issue #19 — batch refused to prevent NULL-embedding rows; please retry)",
+                    e
+                ),
+            ))
         }
     }
+}
 
-    // Issue #58: any key present routes the WHOLE batch through the
-    // engine's atomic batch path (claims + rows in one transaction,
-    // all-or-nothing on conflict — the embedded semantics mcp/hermes
-    // locked). Mixed keyed/unkeyed items ride together; unkeyed items
-    // simply carry no claim.
-    if item_keys.iter().any(|k| k.is_some()) {
-        return remember_batch_with_idempotency(&state, engine, memories, item_keys).await;
-    }
-
-    // Handoff 1b fix 5 (sibling surface): the unkeyed batch loop below
-    // commits mutations the applier will dispatch with
-    // `WriteAdmission::Admitted` (never re-gated). Gate EVERY item at
-    // origin ingress before ANY item enters the commit log, so an enforce
-    // refusal cannot leave a partially-applied batch behind. (The keyed
-    // path above gates inside the engine's atomic `record_batch`.)
+/// Unkeyed path: gate provenance at ingress, then route every batch
+/// entry through commit_log. Handoff 1b fix 5: the loop below commits
+/// mutations the applier dispatches with `WriteAdmission::Admitted`
+/// (never re-gated), so EVERY item is gated at origin ingress before
+/// ANY item enters the commit log — an enforce refusal cannot leave a
+/// partially-applied batch behind (the keyed path gates inside the
+/// engine's atomic `record_batch`). RFC 010 PR-6.4: each entry gets
+/// its own (rid, op_id, log_index); on cluster mode this is N
+/// round-trips through openraft, on single-node N inline applier
+/// dispatches — both preserve byte-determinism across replicas.
+async fn commit_unkeyed_batch(
+    state: &Arc<AppState>,
+    db_id: i64,
+    engine: EngineHandle,
+    memories: Vec<crate::command::RememberInput>,
+) -> AppResult {
     for (i, m) in memories.iter().enumerate() {
         gate_provenance_source_metadata(&engine, &m.source, &m.metadata).map_err(|reason| {
             app_error(
@@ -1790,11 +1833,6 @@ async fn remember_batch(
         })?;
     }
 
-    // RFC 010 PR-6.4: route every batch entry through commit_log. Each
-    // entry gets its own (rid, op_id, log_index). On cluster mode this
-    // is N round-trips through openraft; on single-node it's N inline
-    // applier dispatches. Both paths preserve byte-determinism across
-    // replicas.
     let now_micros = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
@@ -1839,7 +1877,6 @@ async fn remember_batch(
         rids.push(rid);
         last_log_index = receipt.log_index;
     }
-    let _ = engine; // engine handle held only for the quota check above
     let count = rids.len();
     Ok(Json(json!({
         "rids": rids,
