@@ -897,6 +897,20 @@ pub struct BackfillRequest {
 /// Backfill batch size per request round — bounds one pull's size.
 const BACKFILL_BATCH: u64 = 256;
 
+/// One round-trip outcome of a backfill pull: decoded rows, or a retry
+/// carrying the log level, context message, and backoff the original
+/// inline match chain used (warn + 200ms for decode/body failures,
+/// debug + 300ms for transport/status failures).
+enum BackfillPull {
+    Rows(Vec<(u64, LogEntry)>),
+    Retry {
+        warn: bool,
+        ctx: &'static str,
+        err: String,
+        delay_ms: u64,
+    },
+}
+
 /// Pull engine backfill for compacted ranges after a snapshot install
 /// and feed each entry to the owner (which sequences it into the apply
 /// stream). Idle unless `status.backfill_target > applied`. Durably
@@ -912,66 +926,122 @@ async fn run_backfill_task(handle: Arc<YrpHandle>, owner: mpsc::UnboundedSender<
     loop {
         // Wait for engine-incomplete (or exit when the driver drops the
         // status sender).
-        let (from, to, leader_id) = {
-            let s = *status.borrow();
-            (s.applied, s.backfill_target, s.leader.map(|n| n.0))
-        };
-        if to <= from {
-            if status.changed().await.is_err() {
-                return;
-            }
-            continue;
-        }
-        // Source = current leader (a complete node by the eligibility
-        // gate). If we don't know one yet, wait for status to move.
-        let Some(leader_id) = leader_id.filter(|id| *id != handle.node_id.0) else {
-            if status.changed().await.is_err() {
-                return;
-            }
-            continue;
+        let Some((from, to, leader_id)) =
+            wait_for_backfill_work(&mut status, handle.node_id.0).await
+        else {
+            return;
         };
         let Some(base_url) = handle.peer_http.get(&leader_id).cloned() else {
+            // Leader known but missing from the static peer map —
+            // brief poll, the map is config and rarely lags.
             tokio::time::sleep(Duration::from_millis(200)).await;
             continue;
         };
 
         let batch_to = (from + BACKFILL_BATCH).min(to);
-        let req = BackfillRequest {
-            cluster_id: handle.cluster_id,
-            from_index: from,
-            to_index: batch_to,
-        };
-        let url = format!("{}/v1/yrp/backfill", base_url.trim_end_matches('/'));
-        let mut http = client.post(&url).json(&req);
-        if let Some(s) = &handle.cluster_secret {
-            http = http.bearer_auth(s);
-        }
-        match http.send().await {
-            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-                Ok(bytes) => match bincode::deserialize::<Vec<(u64, LogEntry)>>(&bytes) {
-                    Ok(rows) => {
-                        for (index, entry) in rows {
-                            let _ = owner.send(DriverEvent::Backfilled { index, entry });
-                        }
-                        // Let the apply worker make progress before the
-                        // next batch; the status watch reflects it.
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "backfill decode failed; retrying");
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(error = %e, "backfill body read failed; retrying");
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+        match pull_backfill_batch(&client, &handle, &base_url, from, batch_to).await {
+            BackfillPull::Rows(rows) => {
+                for (index, entry) in rows {
+                    let _ = owner.send(DriverEvent::Backfilled { index, entry });
                 }
-            },
-            other => {
-                tracing::debug!(?other, from, batch_to, "backfill pull failed; retrying");
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                // Let the apply worker make progress before the
+                // next batch; the status watch reflects it.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            BackfillPull::Retry {
+                warn,
+                ctx,
+                err,
+                delay_ms,
+            } => {
+                if warn {
+                    tracing::warn!(error = %err, from, batch_to, ctx);
+                } else {
+                    tracing::debug!(error = %err, from, batch_to, ctx);
+                }
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
         }
+    }
+}
+
+/// Block until the engine reports an outstanding backfill gap
+/// (`backfill_target > applied`) AND a leader other than this node.
+/// The eligibility gate only promotes complete nodes, so the leader is
+/// always a valid backfill source. Event-driven: no polling while
+/// idle. Returns None when the driver drops the status sender.
+async fn wait_for_backfill_work(
+    status: &mut watch::Receiver<YrpStatus>,
+    self_node_id: u64,
+) -> Option<(u64, u64, u64)> {
+    loop {
+        let (from, to, leader_id) = {
+            let s = *status.borrow();
+            (s.applied, s.backfill_target, s.leader.map(|n| n.0))
+        };
+        if to > from {
+            if let Some(leader_id) = leader_id.filter(|id| *id != self_node_id) {
+                return Some((from, to, leader_id));
+            }
+        }
+        if status.changed().await.is_err() {
+            return None;
+        }
+    }
+}
+
+/// One HTTP round-trip: POST `/v1/yrp/backfill` to the leader and
+/// decode the bincode rows. Transport failures and non-success
+/// statuses retry at debug (a downed peer must not spam warn); decode
+/// and body failures warn — they mean the leader served something we
+/// cannot apply.
+async fn pull_backfill_batch(
+    client: &reqwest::Client,
+    handle: &YrpHandle,
+    base_url: &str,
+    from: u64,
+    batch_to: u64,
+) -> BackfillPull {
+    let req = BackfillRequest {
+        cluster_id: handle.cluster_id,
+        from_index: from,
+        to_index: batch_to,
+    };
+    let url = format!("{}/v1/yrp/backfill", base_url.trim_end_matches('/'));
+    let mut http = client.post(&url).json(&req);
+    if let Some(s) = &handle.cluster_secret {
+        http = http.bearer_auth(s);
+    }
+    let resp = match http.send().await {
+        Ok(resp) if resp.status().is_success() => resp,
+        other => {
+            return BackfillPull::Retry {
+                warn: false,
+                ctx: "backfill pull failed; retrying",
+                err: format!("{other:?}"),
+                delay_ms: 300,
+            }
+        }
+    };
+    let bytes = match resp.bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return BackfillPull::Retry {
+                warn: true,
+                ctx: "backfill body read failed; retrying",
+                err: e.to_string(),
+                delay_ms: 200,
+            }
+        }
+    };
+    match bincode::deserialize::<Vec<(u64, LogEntry)>>(&bytes) {
+        Ok(rows) => BackfillPull::Rows(rows),
+        Err(e) => BackfillPull::Retry {
+            warn: true,
+            ctx: "backfill decode failed; retrying",
+            err: e.to_string(),
+            delay_ms: 200,
+        },
     }
 }
 
