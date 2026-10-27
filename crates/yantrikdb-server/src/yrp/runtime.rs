@@ -954,10 +954,13 @@ async fn run_backfill_task(handle: Arc<YrpHandle>, owner: mpsc::UnboundedSender<
                 err,
                 delay_ms,
             } => {
+                // "{ctx}" puts the context in the MESSAGE slot — a bare
+                // `ctx` would be a field shorthand and the event would
+                // render with an empty message in structured sinks.
                 if warn {
-                    tracing::warn!(error = %err, from, batch_to, ctx);
+                    tracing::warn!(error = %err, from, batch_to, "{ctx}");
                 } else {
-                    tracing::debug!(error = %err, from, batch_to, ctx);
+                    tracing::debug!(error = %err, from, batch_to, "{ctx}");
                 }
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }

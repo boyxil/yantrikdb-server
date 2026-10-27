@@ -67,8 +67,9 @@ impl EmbeddingSection {
     /// fastembed's builtin strategy at a user-provided ONNX directory,
     /// so it is meaningless with `bundled` (no fastembed model at all)
     /// and `client_only` (no server-side embedder). Called from
-    /// `run_server` so a bad config fails the boot before any tenant
-    /// opens.
+    /// [`ServerConfig::load`] (every subcommand fails identically at
+    /// startup) and again from `run_server` (programmatic configs that
+    /// never passed through `load`).
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.model_dir.is_some() && !matches!(self.strategy, EmbeddingStrategy::Builtin) {
             anyhow::bail!("[embedding] model_dir is only valid with strategy = \"builtin\"");
