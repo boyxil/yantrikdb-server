@@ -56,3 +56,6 @@ benchmarks/skill_recall/queries_groundtruth.jsonl
 benchmarks/skill_recall/skill_id_cache.db
 benchmarks/skill_recall/report.md
 benchmarks/skill_recall/cache_report.md
+
+# repowise owner-digest key (local)
+.repowise/events.key
