@@ -51,6 +51,15 @@ pub struct ServerSection {
 pub struct EmbeddingSection {
     pub strategy: EmbeddingStrategy,
     pub dim: usize,
+    /// Directory with a user-provided ONNX embedding model: an ONNX
+    /// graph (`model_optimized.onnx` / `model.onnx` /
+    /// `model_quantized.onnx`) plus `tokenizer.json`, `config.json`,
+    /// `tokenizer_config.json`, `special_tokens_map.json`. Only valid
+    /// with `strategy = "builtin"`; overrides the default
+    /// `all-MiniLM-L6-v2`. Vectors are mean-pooled over
+    /// `last_hidden_state`; startup fails if the model's output dim
+    /// disagrees with `dim`.
+    pub model_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -492,6 +501,7 @@ impl Default for EmbeddingSection {
         Self {
             strategy: EmbeddingStrategy::Builtin,
             dim: 384,
+            model_dir: None,
         }
     }
 }
@@ -706,10 +716,26 @@ dim = 384
             .unwrap();
         assert!(matches!(cfg.strategy, EmbeddingStrategy::ClientOnly));
 
+        // `model_dir` (fork patch): user-defined ONNX model directory
+        // alongside `builtin`.
+        let toml = r#"[embedding]
+strategy = "builtin"
+dim = 384
+model_dir = "/models/minilm-multilingual"
+"#;
+        let cfg: EmbeddingSection = toml::from_str(toml)
+            .and_then(|v: toml::Value| v["embedding"].clone().try_into())
+            .unwrap();
+        assert_eq!(
+            cfg.model_dir,
+            Some(PathBuf::from("/models/minilm-multilingual"))
+        );
+
         // Default = builtin + dim=384 (backwards compat for configs with
         // no [embedding] section).
         let default = EmbeddingSection::default();
         assert!(matches!(default.strategy, EmbeddingStrategy::Builtin));
         assert_eq!(default.dim, 384);
+        assert_eq!(default.model_dir, None);
     }
 }

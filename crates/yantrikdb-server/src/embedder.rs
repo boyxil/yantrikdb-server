@@ -19,11 +19,16 @@
 //! (RFC 013-B shadow index) automatically invalidates every entry on
 //! lookup — no manual flush required.
 
+use anyhow::Context;
 use parking_lot::Mutex;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{
+    EmbeddingModel, InitOptions, InitOptionsUserDefined, Pooling, QuantizationMode, TextEmbedding,
+    TokenizerFiles, UserDefinedEmbeddingModel,
+};
 
 use crate::cache::{EmbeddingCache, EmbeddingCacheConfig};
 
@@ -32,44 +37,15 @@ use crate::cache::{EmbeddingCache, EmbeddingCacheConfig};
 /// every cache key so an upgrade trivially invalidates stale entries.
 const BUILTIN_MODEL_VERSION: &str = "all-MiniLM-L6-v2";
 
-/// Inner model + cache shared across all engines.
-struct FastEmbedInner {
-    model: Mutex<TextEmbedding>,
-    dim: usize,
-    cache: EmbeddingCache,
-    /// Stable string included in every cache key. Public via
-    /// [`FastEmbedder::model_version`].
-    model_version: &'static str,
-    cache_hits: AtomicU64,
-    cache_misses: AtomicU64,
-}
-
-/// Shareable embedder — clone this to give each engine its own `Box<dyn Embedder>`.
-#[derive(Clone)]
-pub struct FastEmbedder {
-    inner: Arc<FastEmbedInner>,
-}
-
-impl FastEmbedder {
-    pub fn new() -> anyhow::Result<Self> {
-        Self::with_cache_config(EmbeddingCacheConfig::default())
-    }
-
-    /// Construct with a non-default cache size. Operators with high
-    /// memory budgets can dial up `max_entries`; tests can shrink it.
-    pub fn with_cache_config(cache_cfg: EmbeddingCacheConfig) -> anyhow::Result<Self> {
-        tracing::info!("loading embedding model (all-MiniLM-L6-v2)...");
-
-        // ort (the underlying ONNX Runtime binding) panics on dlopen failure
-        // instead of returning an error. Catch the panic and convert it into
-        // a clear actionable error so users don't see a raw stack trace on
-        // first run.
-        let model = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            TextEmbedding::try_new(
-                InitOptions::new(EmbeddingModel::AllMiniLML6V2)
-                    .with_show_download_progress(true),
-            )
-        }))
+/// Load a `TextEmbedding`, converting an ort dlopen PANIC into a clear
+/// actionable error. ort (the underlying ONNX Runtime binding) panics
+/// on dlopen failure instead of returning an error, and a raw stack
+/// trace on first run is hostile.
+fn try_new_catching_ort_panic<F>(load: F) -> anyhow::Result<TextEmbedding>
+where
+    F: FnOnce() -> std::result::Result<TextEmbedding, fastembed::Error>,
+{
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(load))
         .map_err(|panic_info| {
             let msg = panic_info
                 .downcast_ref::<String>()
@@ -105,7 +81,42 @@ impl FastEmbedder {
                 msg,
                 hint,
             )
-        })??;
+        })?
+}
+
+/// Inner model + cache shared across all engines.
+struct FastEmbedInner {
+    model: Mutex<TextEmbedding>,
+    dim: usize,
+    cache: EmbeddingCache,
+    /// Stable string included in every cache key. Public via
+    /// [`FastEmbedder::model_version`].
+    model_version: String,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+}
+
+/// Shareable embedder — clone this to give each engine its own `Box<dyn Embedder>`.
+#[derive(Clone)]
+pub struct FastEmbedder {
+    inner: Arc<FastEmbedInner>,
+}
+
+impl FastEmbedder {
+    pub fn new() -> anyhow::Result<Self> {
+        Self::with_cache_config(EmbeddingCacheConfig::default())
+    }
+
+    /// Construct with a non-default cache size. Operators with high
+    /// memory budgets can dial up `max_entries`; tests can shrink it.
+    pub fn with_cache_config(cache_cfg: EmbeddingCacheConfig) -> anyhow::Result<Self> {
+        tracing::info!("loading embedding model (all-MiniLM-L6-v2)...");
+
+        let model = try_new_catching_ort_panic(|| {
+            TextEmbedding::try_new(
+                InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(true),
+            )
+        })?;
 
         tracing::info!(
             "embedding model loaded (384 dim, cache_capacity={})",
@@ -117,7 +128,120 @@ impl FastEmbedder {
                 model: Mutex::new(model),
                 dim: 384,
                 cache: EmbeddingCache::new(cache_cfg),
-                model_version: BUILTIN_MODEL_VERSION,
+                model_version: BUILTIN_MODEL_VERSION.to_string(),
+                cache_hits: AtomicU64::new(0),
+                cache_misses: AtomicU64::new(0),
+            }),
+        })
+    }
+
+    /// Construct from a directory with a user-provided ONNX embedding
+    /// model: an ONNX graph (`model_optimized.onnx` / `model.onnx` /
+    /// `model_quantized.onnx`) plus the four tokenizer/config JSON
+    /// files fastembed expects. Lets an operator pin a model that is
+    /// NOT in fastembed's download catalog (e.g. the Qdrant
+    /// `paraphrase-multilingual-MiniLM-L12-v2` export) and keeps the
+    /// weights byte-identical to whatever produced the store's
+    /// existing vectors.
+    ///
+    /// Pools with MEAN (MiniLM sentence-transformers layout over
+    /// `last_hidden_state`; fastembed's user-defined default is CLS)
+    /// and marks the graph as dynamically quantized (Qdrant "-onnx-Q"
+    /// exports): ort cannot batch dynamic-quantized MatMuls, so
+    /// fastembed falls back to one text per session call — same as the
+    /// Python fastembed reference behavior for this model.
+    ///
+    /// `expected_dim` comes from `[embedding].dim`; a startup probe
+    /// embed fails the boot if the model disagrees, so a wrong
+    /// pooling/output never reaches tenant data.
+    pub fn from_model_dir(
+        model_dir: &Path,
+        expected_dim: usize,
+        cache_cfg: EmbeddingCacheConfig,
+    ) -> anyhow::Result<Self> {
+        let onnx_name = ["model_optimized.onnx", "model.onnx", "model_quantized.onnx"]
+            .into_iter()
+            .find(|name| model_dir.join(name).exists())
+            .with_context(|| {
+                format!(
+                    "no ONNX model file (model_optimized.onnx / model.onnx / model_quantized.onnx) in {}",
+                    model_dir.display()
+                )
+            })?
+            .to_string();
+        let read = |name: &str| -> anyhow::Result<Vec<u8>> {
+            std::fs::read(model_dir.join(name))
+                .with_context(|| format!("reading {} in {}", name, model_dir.display()))
+        };
+        let tokenizer = TokenizerFiles {
+            tokenizer_file: read("tokenizer.json")?,
+            config_file: read("config.json")?,
+            special_tokens_map_file: read("special_tokens_map.json")?,
+            tokenizer_config_file: read("tokenizer_config.json")?,
+        };
+        let onnx = read(&onnx_name)?;
+
+        tracing::info!(
+            model_dir = %model_dir.display(),
+            onnx = %onnx_name,
+            "loading user-defined embedding model..."
+        );
+
+        let mut model = try_new_catching_ort_panic(|| {
+            TextEmbedding::try_new_from_user_defined(
+                UserDefinedEmbeddingModel::new(onnx, tokenizer)
+                    .with_pooling(Pooling::Mean)
+                    .with_quantization(QuantizationMode::Dynamic),
+                InitOptionsUserDefined::new(),
+            )
+        })?;
+
+        // Verify the model actually produces the configured
+        // dimensionality before any tenant attaches it — a wrong
+        // pooling or output head would otherwise surface as silently
+        // garbage vectors.
+        let probe = model
+            .embed(vec!["yantrikdb embedder dim probe"], None)
+            .map_err(|e| anyhow::anyhow!("dim probe embed failed: {}", e))?
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("dim probe returned no embedding"))?;
+        if probe.len() != expected_dim {
+            anyhow::bail!(
+                "model in {} produces {}-dim embeddings, but [embedding].dim = {}",
+                model_dir.display(),
+                probe.len(),
+                expected_dim
+            );
+        }
+
+        // Cache-version identity: file name + size + mtime of the ONNX
+        // graph, so swapping the model file invalidates every cached
+        // vector on the next lookup.
+        let onnx_meta = std::fs::metadata(model_dir.join(&onnx_name))?;
+        let model_version = format!(
+            "user-defined:{}:{}:{}",
+            onnx_name,
+            onnx_meta.len(),
+            onnx_meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        );
+
+        tracing::info!(
+            "user-defined embedding model loaded ({} dim, cache_capacity={})",
+            expected_dim,
+            cache_cfg.max_entries
+        );
+
+        Ok(Self {
+            inner: Arc::new(FastEmbedInner {
+                model: Mutex::new(model),
+                dim: expected_dim,
+                cache: EmbeddingCache::new(cache_cfg),
+                model_version,
                 cache_hits: AtomicU64::new(0),
                 cache_misses: AtomicU64::new(0),
             }),
@@ -126,8 +250,8 @@ impl FastEmbedder {
 
     /// Stable identifier of the loaded model. Useful for emitting
     /// `embedder_model{version}` Prometheus labels.
-    pub fn model_version(&self) -> &'static str {
-        self.inner.model_version
+    pub fn model_version(&self) -> &str {
+        &self.inner.model_version
     }
 
     /// Cumulative cache hit count since startup. Pair with
@@ -168,7 +292,7 @@ impl yantrikdb::types::Embedder for FastEmbedder {
         if let Some(v) = self
             .inner
             .cache
-            .get_for_text(text, self.inner.model_version)
+            .get_for_text(text, &self.inner.model_version)
         {
             self.inner.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(v);
@@ -188,7 +312,7 @@ impl yantrikdb::types::Embedder for FastEmbedder {
         };
         self.inner
             .cache
-            .put_for_text(text, self.inner.model_version, computed.clone());
+            .put_for_text(text, &self.inner.model_version, computed.clone());
         Ok(computed)
     }
 
@@ -196,7 +320,7 @@ impl yantrikdb::types::Embedder for FastEmbedder {
         &self,
         texts: &[&str],
     ) -> std::result::Result<Vec<Vec<f32>>, Box<dyn std::error::Error + Send + Sync>> {
-        let model_ver = self.inner.model_version;
+        let model_ver = self.inner.model_version.as_str();
 
         // First pass: separate cache hits from misses. We preserve
         // original order via `results: Vec<Option<Vec<f32>>>` indexed

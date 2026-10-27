@@ -1537,13 +1537,39 @@ async fn run_server(cfg: ServerConfig) -> anyhow::Result<()> {
     // Ensure default database exists
     tenant_pool::ensure_default_database(&control, cfg.data_dir())?;
 
+    // [embedding] model_dir swaps the ONNX graph FastEmbedder loads.
+    // It is a builtin-strategy feature: with bundled/client_only there
+    // is no fastembed model to point at.
+    if cfg.embedding.model_dir.is_some()
+        && !matches!(cfg.embedding.strategy, config::EmbeddingStrategy::Builtin)
+    {
+        anyhow::bail!("[embedding] model_dir is only valid with strategy = \"builtin\"");
+    }
+
     // Initialize embedder based on config
     let embedder = match cfg.embedding.strategy {
         config::EmbeddingStrategy::Builtin => {
-            tracing::info!("embedding strategy: builtin (fastembed + ONNX, MiniLM-L6-v2, dim=384)");
-            Some(embedder::ServerEmbedder::Fast(
-                embedder::FastEmbedder::new()?
-            ))
+            if let Some(model_dir) = &cfg.embedding.model_dir {
+                tracing::info!(
+                    model_dir = %model_dir.display(),
+                    dim = cfg.embedding.dim,
+                    "embedding strategy: builtin (user-defined ONNX model)"
+                );
+                Some(embedder::ServerEmbedder::Fast(
+                    embedder::FastEmbedder::from_model_dir(
+                        model_dir,
+                        cfg.embedding.dim,
+                        Default::default(),
+                    )?,
+                ))
+            } else {
+                tracing::info!(
+                    "embedding strategy: builtin (fastembed + ONNX, MiniLM-L6-v2, dim=384)"
+                );
+                Some(embedder::ServerEmbedder::Fast(
+                    embedder::FastEmbedder::new()?
+                ))
+            }
         }
         config::EmbeddingStrategy::Bundled => {
             tracing::info!(
