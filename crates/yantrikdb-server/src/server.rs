@@ -125,26 +125,17 @@ pub async fn run_wire_server(
     );
 
     // Per-IP connection counter for rate limiting (task #78).
-    // Simple HashMap<IpAddr, AtomicU32> with a max concurrent connections
+    // Simple HashMap<IpAddr, u32> with a max concurrent connections
     // per IP. Prevents a single client from exhausting file descriptors.
-    let conn_counts: Arc<parking_lot::Mutex<std::collections::HashMap<std::net::IpAddr, u32>>> =
+    let conn_counts: ConnCounts =
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-    const MAX_CONNS_PER_IP: u32 = 100;
 
     loop {
         let (stream, addr) = listener.accept().await?;
         let ip = addr.ip();
 
-        // Rate limit: reject if this IP has too many open connections
-        {
-            let mut counts = conn_counts.lock();
-            let count = counts.entry(ip).or_insert(0);
-            if *count >= MAX_CONNS_PER_IP {
-                tracing::warn!(%addr, connections = *count, "connection rate limit exceeded");
-                drop(stream);
-                continue;
-            }
-            *count += 1;
+        if !admit_connection(&conn_counts, ip, &addr) {
+            continue;
         }
 
         let state = Arc::clone(&state);
@@ -152,32 +143,67 @@ pub async fn run_wire_server(
         let conn_counts_clone = Arc::clone(&conn_counts);
         tokio::spawn(async move {
             tracing::debug!(%addr, "new connection");
-            let result = if let Some(acceptor) = tls {
-                match acceptor.accept(stream).await {
-                    Ok(tls_stream) => handle_connection_tls(tls_stream, state).await,
-                    Err(e) => {
-                        tracing::warn!(%addr, error = %e, "TLS handshake failed");
-                        return;
-                    }
-                }
-            } else {
-                handle_connection(stream, state).await
-            };
-            if let Err(e) = result {
+            if let Err(e) = handshake_and_handle(tls, stream, state, addr).await {
                 tracing::error!(%addr, error = %e, "connection error");
             }
-            // Decrement per-IP connection counter
-            {
-                let mut counts = conn_counts_clone.lock();
-                if let Some(count) = counts.get_mut(&ip) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        counts.remove(&ip);
-                    }
-                }
-            }
+            release_connection(&conn_counts_clone, ip);
             tracing::debug!(%addr, "connection closed");
         });
+    }
+}
+
+type ConnCounts = Arc<parking_lot::Mutex<std::collections::HashMap<std::net::IpAddr, u32>>>;
+const MAX_CONNS_PER_IP: u32 = 100;
+
+/// Task #78 rate limit. `false` = over the per-IP cap: the connection
+/// is dropped (warn logged, slot NOT taken). `true` = admitted and the
+/// counter incremented.
+fn admit_connection(
+    counts: &ConnCounts,
+    ip: std::net::IpAddr,
+    addr: &std::net::SocketAddr,
+) -> bool {
+    let mut counts = counts.lock();
+    let count = counts.entry(ip).or_insert(0);
+    if *count >= MAX_CONNS_PER_IP {
+        tracing::warn!(%addr, connections = *count, "connection rate limit exceeded");
+        return false;
+    }
+    *count += 1;
+    true
+}
+
+/// Free the per-IP slot when its last connection closes.
+fn release_connection(counts: &ConnCounts, ip: std::net::IpAddr) {
+    let mut counts = counts.lock();
+    if let Some(count) = counts.get_mut(&ip) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(&ip);
+        }
+    }
+}
+
+/// TLS handshake (when configured) then the connection handler. A
+/// failed handshake warns and closes cleanly: it returns Ok so the
+/// caller logs neither a connection error nor skips the per-IP slot
+/// release (the pre-refactor early return leaked the rate-limit slot
+/// for the process lifetime).
+async fn handshake_and_handle(
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    stream: tokio::net::TcpStream,
+    state: Arc<AppState>,
+    addr: std::net::SocketAddr,
+) -> anyhow::Result<()> {
+    let Some(acceptor) = tls else {
+        return handle_connection(stream, state).await;
+    };
+    match acceptor.accept(stream).await {
+        Ok(tls_stream) => handle_connection_tls(tls_stream, state).await,
+        Err(e) => {
+            tracing::warn!(%addr, error = %e, "TLS handshake failed");
+            Ok(())
+        }
     }
 }
 
@@ -193,6 +219,50 @@ async fn handle_connection(
     state: Arc<AppState>,
 ) -> anyhow::Result<()> {
     handle_connection_inner(stream, state).await
+}
+
+/// Some((leader_hint, mode)) when this node must refuse a write:
+/// YRP is active but this node is not the leader, or legacy raft-lite
+/// is not accepting writes. None otherwise (single-node included —
+/// writes flow). v0.8.7 made the replication engine the source of
+/// truth for write acceptance; without this gate a healthy leader
+/// could still reject writes citing "no leader elected" from the
+/// legacy path.
+fn write_denial(state: &AppState) -> Option<(Option<u64>, &'static str)> {
+    if let Some(ref yrp) = state.yrp {
+        if !yrp.is_leader() {
+            let (leader, _) = yrp.leader_hint();
+            return Some((leader, "yrp"));
+        }
+    } else if let Some(ref cluster) = state.cluster {
+        if !cluster.state.accepts_writes() {
+            return Some((
+                cluster.state.current_leader().map(|id| id as u64),
+                "raft-lite",
+            ));
+        }
+    }
+    None
+}
+
+/// Run the engine call on a blocking thread so a slow op (think,
+/// consolidate, embed) cannot park the tokio worker serving the
+/// connection. Holding parking_lot::Mutex across an await would be a
+/// deadlock footgun; spawn_blocking makes that structurally impossible.
+/// A join panic logs and yields no frames — the connection stays open.
+async fn dispatch_command(
+    engine: std::sync::Arc<yantrikdb::YantrikDB>,
+    state: &AppState,
+    cmd: Command,
+    stream_id: u32,
+) -> Vec<Frame> {
+    let control = std::sync::Arc::clone(&state.control);
+    tokio::task::spawn_blocking(move || execute_and_respond(cmd, &engine, &control, stream_id))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "execute_and_respond join error");
+            vec![]
+        })
 }
 
 async fn handle_connection_inner<S>(stream: S, state: Arc<AppState>) -> anyhow::Result<()>
@@ -237,52 +307,19 @@ where
 
         match frame_to_command(&frame) {
             Ok(cmd) => {
-                // v0.8.7: openraft is the source of truth for write
-                // acceptance when active; falls back to legacy raft-lite.
-                // Without this, a healthy openraft leader rejected wire-
-                // protocol writes citing "no leader elected" (raft-lite
-                // has no quorum once openraft is the real write path).
                 if is_write_command(&cmd) {
-                    let mut deny: Option<(Option<u64>, &'static str)> = None;
-                    if let Some(ref yrp) = state.yrp {
-                        if !yrp.is_leader() {
-                            let (leader, _) = yrp.leader_hint();
-                            deny = Some((leader, "yrp"));
-                        }
-                    } else if let Some(ref cluster) = state.cluster {
-                        if !cluster.state.accepts_writes() {
-                            deny = Some((
-                                cluster.state.current_leader().map(|id| id as u64),
-                                "raft-lite",
-                            ));
-                        }
-                    }
-                    if let Some((leader, _mode)) = deny {
-                        let msg = match leader {
-                            Some(id) => format!("not the leader (current leader: node {})", id),
-                            None => "no leader elected (cluster not ready)".into(),
-                        };
+                    if let Some((leader, _mode)) = write_denial(&state) {
+                        let msg = leader
+                            .map(|id| format!("not the leader (current leader: node {})", id))
+                            .unwrap_or_else(|| "no leader elected (cluster not ready)".into());
                         let err = make_error(stream_id, error_codes::READONLY_NODE, msg)?;
                         framed.send(err).await?;
                         continue;
                     }
                 }
 
-                // Run the engine call on a blocking thread so a slow op
-                // (think, consolidate, embed) cannot park the tokio worker
-                // serving this connection. Holding parking_lot::Mutex across
-                // an await would be a deadlock footgun; spawn_blocking makes
-                // that structurally impossible.
-                let engine_clone = std::sync::Arc::clone(&engine);
-                let control_clone = std::sync::Arc::clone(&state.control);
-                let response_frames = tokio::task::spawn_blocking(move || {
-                    execute_and_respond(cmd, &engine_clone, &control_clone, stream_id)
-                })
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::error!(error = %e, "execute_and_respond join error");
-                    vec![]
-                });
+                let response_frames =
+                    dispatch_command(std::sync::Arc::clone(&engine), &state, cmd, stream_id).await;
                 for f in response_frames {
                     framed.send(f).await?;
                 }
