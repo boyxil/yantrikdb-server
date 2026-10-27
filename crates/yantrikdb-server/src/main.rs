@@ -1537,14 +1537,10 @@ async fn run_server(cfg: ServerConfig) -> anyhow::Result<()> {
     // Ensure default database exists
     tenant_pool::ensure_default_database(&control, cfg.data_dir())?;
 
-    // [embedding] model_dir swaps the ONNX graph FastEmbedder loads.
-    // It is a builtin-strategy feature: with bundled/client_only there
-    // is no fastembed model to point at.
-    if cfg.embedding.model_dir.is_some()
-        && !matches!(cfg.embedding.strategy, config::EmbeddingStrategy::Builtin)
-    {
-        anyhow::bail!("[embedding] model_dir is only valid with strategy = \"builtin\"");
-    }
+    // [embedding] model_dir swaps the ONNX graph FastEmbedder loads;
+    // validate() refuses it for non-builtin strategies so a bad config
+    // fails the boot before any tenant opens.
+    cfg.embedding.validate()?;
 
     // Initialize embedder based on config
     let embedder = match cfg.embedding.strategy {

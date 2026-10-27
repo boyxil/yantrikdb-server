@@ -84,6 +84,20 @@ where
         })?
 }
 
+/// Cache-version identity of a user-defined ONNX graph: file name +
+/// size + mtime seconds. Swapping or touching the model file therefore
+/// invalidates every cached vector on the next lookup — no manual
+/// flush. An unreadable mtime (exotic filesystems) degrades to 0.
+fn user_defined_model_version(onnx_name: &str, meta: &std::fs::Metadata) -> String {
+    let mtime_secs = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("user-defined:{}:{}:{}", onnx_name, meta.len(), mtime_secs)
+}
+
 /// Inner model + cache shared across all engines.
 struct FastEmbedInner {
     model: Mutex<TextEmbedding>,
@@ -218,17 +232,7 @@ impl FastEmbedder {
         // graph, so swapping the model file invalidates every cached
         // vector on the next lookup.
         let onnx_meta = std::fs::metadata(model_dir.join(&onnx_name))?;
-        let model_version = format!(
-            "user-defined:{}:{}:{}",
-            onnx_name,
-            onnx_meta.len(),
-            onnx_meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-        );
+        let model_version = user_defined_model_version(&onnx_name, &onnx_meta);
 
         tracing::info!(
             "user-defined embedding model loaded ({} dim, cache_capacity={})",
@@ -435,12 +439,15 @@ impl yantrikdb::types::Embedder for ServerEmbedder {
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests for the cache layering logic. These do NOT invoke
-    //! the actual ONNX runtime — they exercise the cache plumbing via
-    //! a hand-built FastEmbedInner shape that bypasses model load.
+    //! Unit tests for the cache layering logic and config semantics —
+    //! these run WITHOUT the ONNX runtime (cache plumbing via a
+    //! hand-built FastEmbedInner shape that bypasses model load).
     //!
-    //! End-to-end embedder behavior (with the actual ONNX model) is
-    //! covered by integration tests + the bench harness.
+    //! Live tests with a real user-defined ONNX model live here too,
+    //! opt-in via YANTRIKDB_TEST_MODEL_DIR; without it they skip, so
+    //! the default unit run stays ONNX-free. Remaining end-to-end
+    //! coverage (builtin catalog model, HTTP surface) is in the
+    //! integration tests + the bench harness.
 
     use super::*;
 
@@ -512,5 +519,307 @@ mod tests {
             h as f64 / (h + m) as f64
         };
         assert!((rate - 0.7).abs() < 1e-9);
+    }
+
+    // ── user-defined model (model_dir) ────────────────────────────
+
+    /// The cache identity must react to EVERY component of the key —
+    /// name, size, mtime. If any one is dropped, swapping the ONNX
+    /// file would silently serve stale vectors from the previous
+    /// model (issue this guards: "cache keys embed name+size+mtime").
+    #[test]
+    fn user_defined_version_reacts_to_name_size_and_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("model_optimized.onnx");
+        let b = dir.path().join("model.onnx");
+        std::fs::write(&a, vec![0u8; 100]).unwrap();
+        std::fs::write(&b, vec![0u8; 100]).unwrap();
+        let meta_a = std::fs::metadata(&a).unwrap();
+        let meta_b = std::fs::metadata(&b).unwrap();
+
+        // Same file → stable identity.
+        assert_eq!(
+            user_defined_model_version("model_optimized.onnx", &meta_a),
+            user_defined_model_version("model_optimized.onnx", &meta_a)
+        );
+
+        // Different file name → different identity. Same metadata
+        // under both names, so the NAME is the only moving part —
+        // dropping the name from the key would make these equal.
+        assert_ne!(
+            user_defined_model_version("model_optimized.onnx", &meta_a),
+            user_defined_model_version("model.onnx", &meta_a)
+        );
+
+        // Different size → different identity. Rewriting b also moves
+        // its mtime, so pin the timestamp back — size stays the only
+        // moving part and dropping size from the key would make these
+        // equal.
+        std::fs::write(&b, vec![0u8; 101]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&b)
+            .unwrap()
+            .set_modified(meta_b.modified().unwrap())
+            .unwrap();
+        let meta_b_grown = std::fs::metadata(&b).unwrap();
+        assert_eq!(meta_b_grown.len(), 101);
+        // Durations, not Results: SystemTimeError is not PartialEq.
+        assert_eq!(
+            meta_b_grown
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap(),
+            meta_b
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap(),
+            "same mtime, only size moved"
+        );
+        assert_ne!(
+            user_defined_model_version("model.onnx", &meta_b),
+            user_defined_model_version("model.onnx", &meta_b_grown)
+        );
+
+        // Same name and size, only mtime moved — the swap-in-place
+        // case (same file path, new weights). set_modified pins the
+        // timestamp so the test can't race the one-second resolution.
+        let bumped = meta_a.modified().unwrap() + std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&a)
+            .unwrap()
+            .set_modified(bumped)
+            .unwrap();
+        let meta_a_touched = std::fs::metadata(&a).unwrap();
+        assert_eq!(
+            meta_a_touched.len(),
+            meta_a.len(),
+            "same size, only mtime moved"
+        );
+        assert_ne!(
+            user_defined_model_version("model_optimized.onnx", &meta_a),
+            user_defined_model_version("model_optimized.onnx", &meta_a_touched)
+        );
+    }
+
+    /// The version string feeds `EmbeddingCacheKey`; differing versions
+    /// must produce differing cache keys, which is what actually
+    /// invalidates stale entries on lookup.
+    #[test]
+    fn user_defined_version_invalidates_cache_keys() {
+        use crate::cache::embedding::EmbeddingCacheKey;
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("model.onnx");
+        std::fs::write(&a, vec![0u8; 10]).unwrap();
+        let v1 = user_defined_model_version("model.onnx", &std::fs::metadata(&a).unwrap());
+        std::fs::write(&a, vec![0u8; 11]).unwrap();
+        let v2 = user_defined_model_version("model.onnx", &std::fs::metadata(&a).unwrap());
+        assert_ne!(v1, v2);
+        assert_ne!(
+            EmbeddingCacheKey::for_text("hi", &v1),
+            EmbeddingCacheKey::for_text("hi", &v2)
+        );
+    }
+
+    /// `from_model_dir` must fail BEFORE touching the ONNX runtime when
+    /// the directory has no ONNX graph at all — the failure stays
+    /// instant and filesystem-shaped instead of an ort load error.
+    #[test]
+    fn from_model_dir_rejects_dir_without_onnx_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        // match instead of expect_err: FastEmbedder is not Debug.
+        let err = match FastEmbedder::from_model_dir(dir.path(), 384, Default::default()) {
+            Ok(_) => panic!("empty dir must be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("no ONNX model file"), "got: {err}");
+    }
+
+    /// A graph without the four tokenizer/config files fastembed
+    /// requires is likewise rejected before model load.
+    #[test]
+    fn from_model_dir_rejects_dir_without_tokenizer_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("model.onnx"), b"fake-graph").unwrap();
+        let err = match FastEmbedder::from_model_dir(dir.path(), 384, Default::default()) {
+            Ok(_) => panic!("missing tokenizer must be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("tokenizer.json"), "got: {err}");
+    }
+
+    /// Live-model tests need a real user-defined model directory (ONNX
+    /// graph + tokenizer files) and the ONNX Runtime dylib. Opt-in via
+    /// YANTRIKDB_TEST_MODEL_DIR (optionally YANTRIKDB_TEST_MODEL_DIM,
+    /// default 384) so environments without a model skip instead of
+    /// failing. An explicitly SET but unusable variable is a setup
+    /// error and panics loudly — a typo must not masquerade as a
+    /// passing (vacuously skipped) live test.
+    fn live_model_dir() -> Option<std::path::PathBuf> {
+        let dir = std::env::var("YANTRIKDB_TEST_MODEL_DIR").ok()?;
+        let dir = std::path::PathBuf::from(dir);
+        if !["model_optimized.onnx", "model.onnx", "model_quantized.onnx"]
+            .iter()
+            .any(|name| dir.join(name).exists())
+        {
+            panic!(
+                "YANTRIKDB_TEST_MODEL_DIR is set but contains no ONNX graph: {} — \
+                 unset it to skip live tests, or fix the path",
+                dir.display()
+            );
+        }
+        Some(dir)
+    }
+
+    fn live_model_dim() -> usize {
+        match std::env::var("YANTRIKDB_TEST_MODEL_DIM") {
+            Err(_) => 384,
+            Ok(v) => v.parse().unwrap_or_else(|_| {
+                panic!("YANTRIKDB_TEST_MODEL_DIM is set but not a number: {v}")
+            }),
+        }
+    }
+
+    #[test]
+    fn from_model_dir_boots_with_matching_dim_and_embeds() {
+        let Some(dir) = live_model_dir() else {
+            eprintln!("skipping: YANTRIKDB_TEST_MODEL_DIR not set or has no ONNX graph");
+            return;
+        };
+        let dim = live_model_dim();
+        let embedder = FastEmbedder::from_model_dir(&dir, dim, Default::default())
+            .expect("matching dim must boot");
+
+        assert!(
+            embedder.model_version().starts_with("user-defined:"),
+            "got: {}",
+            embedder.model_version()
+        );
+
+        use yantrikdb::types::Embedder as _;
+        let v = embedder.embed("привет").expect("embed must work");
+        assert_eq!(v.len(), dim);
+
+        // Second call on the same text is a cache hit under the
+        // versioned key.
+        let _ = embedder.embed("привет").unwrap();
+        assert_eq!(embedder.cache_hits(), 1);
+        assert_eq!(embedder.cache_misses(), 1);
+    }
+
+    #[test]
+    fn from_model_dir_fails_boot_on_dim_mismatch() {
+        let Some(dir) = live_model_dir() else {
+            eprintln!("skipping: YANTRIKDB_TEST_MODEL_DIR not set or has no ONNX graph");
+            return;
+        };
+        let wrong = live_model_dim() + 1;
+        let err = match FastEmbedder::from_model_dir(&dir, wrong, Default::default()) {
+            Ok(_) => panic!("mismatched dim must fail the boot"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("produces"), "got: {msg}");
+        assert!(msg.contains(&format!("dim = {wrong}")), "got: {msg}");
+    }
+
+    /// Cosine of two unit-normalized-ish embedding vectors.
+    fn cos(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        dot / (na * nb)
+    }
+
+    /// Semantic regression pin for the user-defined model. Dimension
+    /// checks alone would let a wrong POOLING (fastembed's user-defined
+    /// default is CLS, this feature needs Mean) or a wrong quantization
+    /// mode ship 384-dim vectors with garbage geometry — every other
+    /// test would stay green. Reference values were measured on the
+    /// canary-verified build (vectors byte-matched the Python fastembed
+    /// client); the ±0.03 band absorbs ONNX Runtime float drift.
+    #[test]
+    fn from_model_dir_semantic_geometry_is_pinned() {
+        let Some(dir) = live_model_dir() else {
+            eprintln!("skipping: YANTRIKDB_TEST_MODEL_DIR not set or has no ONNX graph");
+            return;
+        };
+        let embedder = FastEmbedder::from_model_dir(&dir, live_model_dim(), Default::default())
+            .expect("matching dim must boot");
+        use yantrikdb::types::Embedder as _;
+
+        let hi_ru = embedder.embed("привет мир").unwrap();
+        let hi_en = embedder.embed("hello world").unwrap();
+        let cat_ru = embedder.embed("кот сидит на окне").unwrap();
+        let cat_en = embedder.embed("the cat sits on the window").unwrap();
+        let junk = embedder
+            .embed("квартальный финансовый отчёт по закупкам")
+            .unwrap();
+
+        // Cross-lingual near-paraphrases land close together…
+        let cos_hi = cos(&hi_ru, &hi_en);
+        assert!(
+            (0.695..=0.755).contains(&cos_hi),
+            "cos(привет мир, hello world) = {cos_hi}, expected 0.7254 ± 0.03 — \
+             pooling/quantization regression?"
+        );
+        let cos_cat = cos(&cat_ru, &cat_en);
+        assert!(
+            (0.938..=0.998).contains(&cos_cat),
+            "cos(cat ru/en) = {cos_cat}, expected 0.9683 ± 0.03"
+        );
+
+        // …while an unrelated memory stays far away. This ordering is
+        // the whole point of the multilingual model: the old bundled
+        // embedder had a ~0.99 median cosine between ANY two records
+        // and could not rank.
+        let cos_junk = cos(&cat_ru, &junk);
+        assert!(
+            cos_cat > cos_junk + 0.2,
+            "related pair ({cos_cat}) must beat unrelated ({cos_junk}) with margin"
+        );
+    }
+
+    /// The batch path must agree with single-text embeds on the
+    /// user-defined model. Dynamic quantization forces fastembed into
+    /// one text per session call; if that fallback regressed (a real
+    /// batch through a dynamic-quantized graph errors in ort), this
+    /// catches it. Two model loads so neither side reads the other's
+    /// cache — the comparison exercises real computation both ways.
+    #[test]
+    fn from_model_dir_embed_batch_matches_single_embeds() {
+        let Some(dir) = live_model_dir() else {
+            eprintln!("skipping: YANTRIKDB_TEST_MODEL_DIR not set or has no ONNX graph");
+            return;
+        };
+        let batcher = FastEmbedder::from_model_dir(&dir, live_model_dim(), Default::default())
+            .expect("matching dim must boot");
+        let singler = FastEmbedder::from_model_dir(&dir, live_model_dim(), Default::default())
+            .expect("matching dim must boot");
+
+        let texts = ["запись про кластеризацию", "a note about embeddings"];
+        use yantrikdb::types::Embedder as _;
+        let batched = batcher.embed_batch(&texts).expect("embed_batch must work");
+        assert_eq!(batched.len(), 2);
+        assert_eq!(batcher.cache_misses(), 2, "both texts are fresh misses");
+        assert_eq!(batcher.cache_hits(), 0);
+
+        for (text, bvec) in texts.iter().zip(batched.iter()) {
+            let svec = singler.embed(text).expect("single embed must work");
+            assert_eq!(svec.len(), bvec.len());
+            let c = cos(bvec, &svec);
+            assert!(
+                c > 0.999999,
+                "batch vs single diverged for {text:?}: cos = {c}"
+            );
+        }
+
+        // Re-batching the same texts is served entirely from cache.
+        let _ = batcher.embed_batch(&texts).unwrap();
+        assert_eq!(batcher.cache_hits(), 2);
+        assert_eq!(batcher.cache_misses(), 2);
     }
 }

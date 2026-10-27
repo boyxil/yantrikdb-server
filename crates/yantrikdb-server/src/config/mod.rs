@@ -62,6 +62,21 @@ pub struct EmbeddingSection {
     pub model_dir: Option<PathBuf>,
 }
 
+impl EmbeddingSection {
+    /// Cross-field semantics serde cannot express: `model_dir` points
+    /// fastembed's builtin strategy at a user-provided ONNX directory,
+    /// so it is meaningless with `bundled` (no fastembed model at all)
+    /// and `client_only` (no server-side embedder). Called from
+    /// `run_server` so a bad config fails the boot before any tenant
+    /// opens.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.model_dir.is_some() && !matches!(self.strategy, EmbeddingStrategy::Builtin) {
+            anyhow::bail!("[embedding] model_dir is only valid with strategy = \"builtin\"");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 #[derive(Default)]
@@ -737,5 +752,49 @@ model_dir = "/models/minilm-multilingual"
         assert!(matches!(default.strategy, EmbeddingStrategy::Builtin));
         assert_eq!(default.dim, 384);
         assert_eq!(default.model_dir, None);
+    }
+
+    /// `model_dir` points fastembed's builtin strategy at an ONNX
+    /// directory, so the other strategies must refuse it — `bundled`
+    /// has no fastembed model to point at, `client_only` has no
+    /// server-side embedder at all. With `model_dir` unset every
+    /// strategy stays exactly as valid as before the field existed.
+    #[test]
+    fn model_dir_requires_builtin_strategy() {
+        let with_dir = |strategy| EmbeddingSection {
+            strategy,
+            dim: 384,
+            model_dir: Some(PathBuf::from("/models/minilm-multilingual")),
+        };
+
+        assert!(with_dir(EmbeddingStrategy::Builtin).validate().is_ok());
+
+        for strategy in [EmbeddingStrategy::Bundled, EmbeddingStrategy::ClientOnly] {
+            let err = with_dir(strategy).validate().expect_err("must be refused");
+            assert!(
+                err.to_string().contains("model_dir"),
+                "error should name the offending field, got: {err}"
+            );
+            assert!(
+                err.to_string().contains("builtin"),
+                "error should name the required strategy, got: {err}"
+            );
+        }
+
+        let without_dir = |strategy| EmbeddingSection {
+            strategy,
+            dim: 384,
+            model_dir: None,
+        };
+        for strategy in [
+            EmbeddingStrategy::Builtin,
+            EmbeddingStrategy::Bundled,
+            EmbeddingStrategy::ClientOnly,
+        ] {
+            assert!(
+                without_dir(strategy).validate().is_ok(),
+                "unset model_dir must not constrain strategy"
+            );
+        }
     }
 }
