@@ -110,17 +110,21 @@ class UrgeQueue:
             "ORDER BY urgency DESC LIMIT ?",
             (limit,),
         ).fetchall()
+        if not rows:
+            return []
 
-        result = []
+        # One UPDATE for the whole batch instead of one per row — the
+        # row set is already fixed by the SELECT above, so the loop
+        # only multiplied round-trips.
         now = time.time()
-        for row in rows:
-            self._conn.execute(
-                "UPDATE urges SET status = 'delivered', delivered_at = ? WHERE urge_id = ?",
-                (now, row["urge_id"]),
-            )
-            result.append(dict(row))
-
-        return result
+        ids = [row["urge_id"] for row in rows]
+        placeholders = ",".join("?" * len(ids))
+        self._conn.execute(
+            f"UPDATE urges SET status = 'delivered', delivered_at = ? "
+            f"WHERE urge_id IN ({placeholders})",
+            (now, *ids),
+        )
+        return [dict(row) for row in rows]
 
     def pop_due(self, threshold: float = 0.0) -> list[dict]:
         """Get all pending urges above urgency threshold."""
