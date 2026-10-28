@@ -2596,22 +2596,22 @@ async fn cluster_promote(
     })))
 }
 
-/// GET /metrics — Prometheus-format metrics for monitoring.
-async fn metrics(State(state): State<Arc<AppState>>) -> String {
-    let mut out = String::new();
-
+fn append_engines_gauge(state: &AppState, out: &mut String) {
     out.push_str("# HELP yantrikdb_engines_loaded Number of engine instances currently loaded\n");
     out.push_str("# TYPE yantrikdb_engines_loaded gauge\n");
     out.push_str(&format!(
         "yantrikdb_engines_loaded {}\n",
         state.pool.loaded_count()
     ));
+}
 
-    // v0.8.7: Prometheus cluster gauges read from cluster_state_view so
-    // openraft is the source of truth when active. Without this, on a
-    // healthy openraft cluster, `yantrikdb_cluster_is_leader` shows 0 on
-    // the actual leader (because legacy raft-lite has no quorum).
-    if let Some(view) = cluster_state_view(&state) {
+/// v0.8.7: Prometheus cluster gauges read from cluster_state_view so
+/// openraft is the source of truth when active. Without this, on a
+/// healthy openraft cluster, `yantrikdb_cluster_is_leader` shows 0 on
+/// the actual leader (because legacy raft-lite has no quorum).
+/// Peer reachability is raft-lite-specific.
+fn append_cluster_gauges(state: &AppState, out: &mut String) {
+    if let Some(view) = cluster_state_view(state) {
         out.push_str("# HELP yantrikdb_cluster_term Current Raft term\n");
         out.push_str("# TYPE yantrikdb_cluster_term gauge\n");
         out.push_str(&format!(
@@ -2639,201 +2639,203 @@ async fn metrics(State(state): State<Arc<AppState>>) -> String {
             if view.healthy { 1 } else { 0 }
         ));
     }
-    // Peer reachability is raft-lite-specific.
-    {
-        if let Some(ref cluster) = state.cluster {
-            out.push_str(
-                "# HELP yantrikdb_cluster_peer_reachable Whether each peer is reachable\n",
-            );
-            out.push_str("# TYPE yantrikdb_cluster_peer_reachable gauge\n");
-            for peer in cluster.peers.snapshot() {
-                out.push_str(&format!(
-                    "yantrikdb_cluster_peer_reachable {{addr=\"{}\",role=\"{:?}\"}} {}\n",
-                    peer.addr,
-                    peer.configured_role,
-                    if peer.reachable { 1 } else { 0 }
-                ));
-            }
+
+    if let Some(ref cluster) = state.cluster {
+        out.push_str("# HELP yantrikdb_cluster_peer_reachable Whether each peer is reachable\n");
+        out.push_str("# TYPE yantrikdb_cluster_peer_reachable gauge\n");
+        for peer in cluster.peers.snapshot() {
+            out.push_str(&format!(
+                "yantrikdb_cluster_peer_reachable {{addr=\"{}\",role=\"{:?}\"}} {}\n",
+                peer.addr,
+                peer.configured_role,
+                if peer.reachable { 1 } else { 0 }
+            ));
         }
     }
+}
 
-    // Per-database stats (default DB only for now).
-    // IMPORTANT: do NOT hold control.lock() across engine.lock() — that
-    // serializes /metrics behind any long-running engine call AND blocks all
-    // auth (which needs control). Scope the control lock tightly, then drop
-    // it before touching the engine.
+/// Per-database stats (default DB only for now).
+/// IMPORTANT: do NOT hold control.lock() across engine.lock() — that
+/// serializes /metrics behind any long-running engine call AND blocks all
+/// auth (which needs control). Scope the control lock tightly, then drop
+/// it before touching the engine.
+fn append_default_db_gauges(state: &AppState, out: &mut String) {
     let default_db = {
         let control = state.control.lock();
         control.get_database("default").ok().flatten()
     };
-    if let Some(rec) = default_db {
-        if let Ok(engine) = state.pool.get_engine(&rec) {
-            let stats_opt = {
-                // v0.8.9: Arc<YantrikDB> direct (no outer mutex); stats()
-                // uses engine's internal read connection pool.
-                engine.stats(None).ok()
-            };
-            if let Some(stats) = stats_opt {
-                {
-                    out.push_str("# HELP yantrikdb_active_memories Number of active memories\n");
-                    out.push_str("# TYPE yantrikdb_active_memories gauge\n");
-                    out.push_str(&format!(
-                        "yantrikdb_active_memories {{db=\"default\"}} {}\n",
-                        stats.active_memories
-                    ));
+    let Some(rec) = default_db else {
+        return;
+    };
+    let Ok(engine) = state.pool.get_engine(&rec) else {
+        return;
+    };
+    // v0.8.9: Arc<YantrikDB> direct (no outer mutex); stats() uses the
+    // engine's internal read connection pool.
+    let Some(stats) = engine.stats(None).ok() else {
+        return;
+    };
+    out.push_str("# HELP yantrikdb_active_memories Number of active memories\n");
+    out.push_str("# TYPE yantrikdb_active_memories gauge\n");
+    out.push_str(&format!(
+        "yantrikdb_active_memories {{db=\"default\"}} {}\n",
+        stats.active_memories
+    ));
 
-                    out.push_str(
-                        "# HELP yantrikdb_consolidated_memories Number of consolidated memories\n",
-                    );
-                    out.push_str("# TYPE yantrikdb_consolidated_memories gauge\n");
-                    out.push_str(&format!(
-                        "yantrikdb_consolidated_memories {{db=\"default\"}} {}\n",
-                        stats.consolidated_memories
-                    ));
+    out.push_str("# HELP yantrikdb_consolidated_memories Number of consolidated memories\n");
+    out.push_str("# TYPE yantrikdb_consolidated_memories gauge\n");
+    out.push_str(&format!(
+        "yantrikdb_consolidated_memories {{db=\"default\"}} {}\n",
+        stats.consolidated_memories
+    ));
 
-                    out.push_str("# HELP yantrikdb_edges Number of knowledge graph edges\n");
-                    out.push_str("# TYPE yantrikdb_edges gauge\n");
-                    out.push_str(&format!(
-                        "yantrikdb_edges {{db=\"default\"}} {}\n",
-                        stats.edges
-                    ));
+    out.push_str("# HELP yantrikdb_edges Number of knowledge graph edges\n");
+    out.push_str("# TYPE yantrikdb_edges gauge\n");
+    out.push_str(&format!(
+        "yantrikdb_edges {{db=\"default\"}} {}\n",
+        stats.edges
+    ));
 
-                    out.push_str(
-                        "# HELP yantrikdb_open_conflicts Number of unresolved conflicts\n",
-                    );
-                    out.push_str("# TYPE yantrikdb_open_conflicts gauge\n");
-                    out.push_str(&format!(
-                        "yantrikdb_open_conflicts {{db=\"default\"}} {}\n",
-                        stats.open_conflicts
-                    ));
+    out.push_str("# HELP yantrikdb_open_conflicts Number of unresolved conflicts\n");
+    out.push_str("# TYPE yantrikdb_open_conflicts gauge\n");
+    out.push_str(&format!(
+        "yantrikdb_open_conflicts {{db=\"default\"}} {}\n",
+        stats.open_conflicts
+    ));
 
-                    out.push_str("# HELP yantrikdb_operations_total Total operations\n");
-                    out.push_str("# TYPE yantrikdb_operations_total counter\n");
-                    out.push_str(&format!(
-                        "yantrikdb_operations_total {{db=\"default\"}} {}\n",
-                        stats.operations
-                    ));
-                }
-            }
-        }
-    }
+    out.push_str("# HELP yantrikdb_operations_total Total operations\n");
+    out.push_str("# TYPE yantrikdb_operations_total counter\n");
+    out.push_str(&format!(
+        "yantrikdb_operations_total {{db=\"default\"}} {}\n",
+        stats.operations
+    ));
+}
 
-    // RFC 027 / v0.8.24 — autonomous-maintenance metrics. The write-rich/
-    // close-poor dashboard: how often hygiene ran per tenant and what it
-    // closed, plus skip/failure counters and the cycle-duration histogram.
-    {
-        let aggs = crate::metrics::maintenance_aggs_snapshot();
-        if !aggs.is_empty() {
-            out.push_str("# HELP yantrikdb_maintenance_runs_total Maintenance cycles completed\n");
-            out.push_str("# TYPE yantrikdb_maintenance_runs_total counter\n");
-            for (db, a) in &aggs {
-                out.push_str(&format!(
-                    "yantrikdb_maintenance_runs_total{{db=\"{db}\"}} {}\n",
-                    a.runs
-                ));
-            }
-            out.push_str(
-                "# HELP yantrikdb_maintenance_conflicts_resolved_total Conflicts auto-resolved by maintenance\n",
-            );
-            out.push_str("# TYPE yantrikdb_maintenance_conflicts_resolved_total counter\n");
-            for (db, a) in &aggs {
-                out.push_str(&format!(
-                    "yantrikdb_maintenance_conflicts_resolved_total{{db=\"{db}\"}} {}\n",
-                    a.conflicts_resolved
-                ));
-            }
-            out.push_str(
-                "# HELP yantrikdb_maintenance_triggers_pruned_total Pending triggers expired by maintenance\n",
-            );
-            out.push_str("# TYPE yantrikdb_maintenance_triggers_pruned_total counter\n");
-            for (db, a) in &aggs {
-                out.push_str(&format!(
-                    "yantrikdb_maintenance_triggers_pruned_total{{db=\"{db}\"}} {}\n",
-                    a.triggers_pruned
-                ));
-            }
-            out.push_str(
-                "# HELP yantrikdb_maintenance_consolidations_total Consolidations performed by maintenance\n",
-            );
-            out.push_str("# TYPE yantrikdb_maintenance_consolidations_total counter\n");
-            for (db, a) in &aggs {
-                out.push_str(&format!(
-                    "yantrikdb_maintenance_consolidations_total{{db=\"{db}\"}} {}\n",
-                    a.consolidations
-                ));
-            }
-            out.push_str(
-                "# HELP yantrikdb_maintenance_entities_linked_total Memory-entity links backfilled by maintenance\n",
-            );
-            out.push_str("# TYPE yantrikdb_maintenance_entities_linked_total counter\n");
-            for (db, a) in &aggs {
-                out.push_str(&format!(
-                    "yantrikdb_maintenance_entities_linked_total{{db=\"{db}\"}} {}\n",
-                    a.entities_linked
-                ));
-            }
-            out.push_str(
-                "# HELP yantrikdb_maintenance_relations_upserted_total Co-occurrence edges upserted by maintenance\n",
-            );
-            out.push_str("# TYPE yantrikdb_maintenance_relations_upserted_total counter\n");
-            for (db, a) in &aggs {
-                out.push_str(&format!(
-                    "yantrikdb_maintenance_relations_upserted_total{{db=\"{db}\"}} {}\n",
-                    a.relations_upserted
-                ));
-            }
-            out.push_str(
-                "# HELP yantrikdb_maintenance_failures_total Maintenance cycles that returned an error\n",
-            );
-            out.push_str("# TYPE yantrikdb_maintenance_failures_total counter\n");
-            for (db, a) in &aggs {
-                out.push_str(&format!(
-                    "yantrikdb_maintenance_failures_total{{db=\"{db}\"}} {}\n",
-                    a.failures
-                ));
-            }
-            out.push_str(
-                "# HELP yantrikdb_maintenance_pass_errors_total Per-pass errors recorded across maintenance cycles\n",
-            );
-            out.push_str("# TYPE yantrikdb_maintenance_pass_errors_total counter\n");
-            for (db, a) in &aggs {
-                out.push_str(&format!(
-                    "yantrikdb_maintenance_pass_errors_total{{db=\"{db}\"}} {}\n",
-                    a.pass_errors
-                ));
-            }
-        }
+/// GET /metrics — Prometheus-format metrics for monitoring.
+async fn metrics(State(state): State<Arc<AppState>>) -> String {
+    let mut out = String::new();
 
-        let skipped = crate::metrics::maintenance_skipped_snapshot();
-        if !skipped.is_empty() {
-            out.push_str(
-                "# HELP yantrikdb_maintenance_runs_skipped_total Maintenance ticks skipped, by reason\n",
-            );
-            out.push_str("# TYPE yantrikdb_maintenance_runs_skipped_total counter\n");
-            for (db, reason, count) in &skipped {
-                out.push_str(&format!(
-                    "yantrikdb_maintenance_runs_skipped_total{{db=\"{db}\",reason=\"{reason}\"}} {count}\n"
-                ));
-            }
-        }
-
-        let (mcount, msum) = crate::metrics::maintenance_duration_totals();
-        if mcount > 0 {
-            out.push_str(
-                "# HELP yantrikdb_maintenance_duration_ms Maintenance-cycle wall-clock duration (ms)\n",
-            );
-            out.push_str("# TYPE yantrikdb_maintenance_duration_ms summary\n");
-            out.push_str(&format!("yantrikdb_maintenance_duration_ms_sum {msum}\n"));
-            out.push_str(&format!(
-                "yantrikdb_maintenance_duration_ms_count {mcount}\n"
-            ));
-        }
-    }
+    append_engines_gauge(&state, &mut out);
+    append_cluster_gauges(&state, &mut out);
+    append_default_db_gauges(&state, &mut out);
+    append_maintenance_metrics(&mut out);
 
     // Append per-handler histograms, lock-wait histograms, request counters
     out.push_str(&crate::metrics::global().render_prometheus());
 
     out
+}
+
+/// RFC 027 / v0.8.24 — autonomous-maintenance metrics. The write-rich/
+/// close-poor dashboard: how often hygiene ran per tenant and what it
+/// closed, plus skip/failure counters and the cycle-duration histogram.
+fn append_maintenance_metrics(out: &mut String) {
+    let aggs = crate::metrics::maintenance_aggs_snapshot();
+    if !aggs.is_empty() {
+        out.push_str("# HELP yantrikdb_maintenance_runs_total Maintenance cycles completed\n");
+        out.push_str("# TYPE yantrikdb_maintenance_runs_total counter\n");
+        for (db, a) in &aggs {
+            out.push_str(&format!(
+                "yantrikdb_maintenance_runs_total{{db=\"{db}\"}} {}\n",
+                a.runs
+            ));
+        }
+        out.push_str(
+                "# HELP yantrikdb_maintenance_conflicts_resolved_total Conflicts auto-resolved by maintenance\n",
+            );
+        out.push_str("# TYPE yantrikdb_maintenance_conflicts_resolved_total counter\n");
+        for (db, a) in &aggs {
+            out.push_str(&format!(
+                "yantrikdb_maintenance_conflicts_resolved_total{{db=\"{db}\"}} {}\n",
+                a.conflicts_resolved
+            ));
+        }
+        out.push_str(
+                "# HELP yantrikdb_maintenance_triggers_pruned_total Pending triggers expired by maintenance\n",
+            );
+        out.push_str("# TYPE yantrikdb_maintenance_triggers_pruned_total counter\n");
+        for (db, a) in &aggs {
+            out.push_str(&format!(
+                "yantrikdb_maintenance_triggers_pruned_total{{db=\"{db}\"}} {}\n",
+                a.triggers_pruned
+            ));
+        }
+        out.push_str(
+                "# HELP yantrikdb_maintenance_consolidations_total Consolidations performed by maintenance\n",
+            );
+        out.push_str("# TYPE yantrikdb_maintenance_consolidations_total counter\n");
+        for (db, a) in &aggs {
+            out.push_str(&format!(
+                "yantrikdb_maintenance_consolidations_total{{db=\"{db}\"}} {}\n",
+                a.consolidations
+            ));
+        }
+        out.push_str(
+                "# HELP yantrikdb_maintenance_entities_linked_total Memory-entity links backfilled by maintenance\n",
+            );
+        out.push_str("# TYPE yantrikdb_maintenance_entities_linked_total counter\n");
+        for (db, a) in &aggs {
+            out.push_str(&format!(
+                "yantrikdb_maintenance_entities_linked_total{{db=\"{db}\"}} {}\n",
+                a.entities_linked
+            ));
+        }
+        out.push_str(
+                "# HELP yantrikdb_maintenance_relations_upserted_total Co-occurrence edges upserted by maintenance\n",
+            );
+        out.push_str("# TYPE yantrikdb_maintenance_relations_upserted_total counter\n");
+        for (db, a) in &aggs {
+            out.push_str(&format!(
+                "yantrikdb_maintenance_relations_upserted_total{{db=\"{db}\"}} {}\n",
+                a.relations_upserted
+            ));
+        }
+        out.push_str(
+                "# HELP yantrikdb_maintenance_failures_total Maintenance cycles that returned an error\n",
+            );
+        out.push_str("# TYPE yantrikdb_maintenance_failures_total counter\n");
+        for (db, a) in &aggs {
+            out.push_str(&format!(
+                "yantrikdb_maintenance_failures_total{{db=\"{db}\"}} {}\n",
+                a.failures
+            ));
+        }
+        out.push_str(
+                "# HELP yantrikdb_maintenance_pass_errors_total Per-pass errors recorded across maintenance cycles\n",
+            );
+        out.push_str("# TYPE yantrikdb_maintenance_pass_errors_total counter\n");
+        for (db, a) in &aggs {
+            out.push_str(&format!(
+                "yantrikdb_maintenance_pass_errors_total{{db=\"{db}\"}} {}\n",
+                a.pass_errors
+            ));
+        }
+    }
+
+    let skipped = crate::metrics::maintenance_skipped_snapshot();
+    if !skipped.is_empty() {
+        out.push_str(
+                "# HELP yantrikdb_maintenance_runs_skipped_total Maintenance ticks skipped, by reason\n",
+            );
+        out.push_str("# TYPE yantrikdb_maintenance_runs_skipped_total counter\n");
+        for (db, reason, count) in &skipped {
+            out.push_str(&format!(
+                    "yantrikdb_maintenance_runs_skipped_total{{db=\"{db}\",reason=\"{reason}\"}} {count}\n"
+                ));
+        }
+    }
+
+    let (mcount, msum) = crate::metrics::maintenance_duration_totals();
+    if mcount > 0 {
+        out.push_str(
+            "# HELP yantrikdb_maintenance_duration_ms Maintenance-cycle wall-clock duration (ms)\n",
+        );
+        out.push_str("# TYPE yantrikdb_maintenance_duration_ms summary\n");
+        out.push_str(&format!("yantrikdb_maintenance_duration_ms_sum {msum}\n"));
+        out.push_str(&format!(
+            "yantrikdb_maintenance_duration_ms_count {mcount}\n"
+        ));
+    }
 }
 
 async fn cluster_status(State(state): State<Arc<AppState>>) -> Json<Value> {
