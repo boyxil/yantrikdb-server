@@ -680,6 +680,86 @@ fn three_nodes_elect_exactly_one_leader() {
     );
 }
 
+/// Pins the durable-staging semantics of the on_append_entries guard
+/// paths (the A1 one-decision-one-persist lesson): a leader with a
+/// NEWER term that fails the continuity check makes the follower
+/// (a) stage the adopted hard state in the same effects batch, and
+/// (b) WITHHOLD the refusal until that persist is confirmed — the node
+/// never replies from a term it has not durably adopted (a "ghost-term
+/// ack" would let a stale-term crash resurrect and double-answer).
+/// Sensitivity benchmark: inverting the staged_response routing must
+/// fail this test.
+#[test]
+fn guard_refusal_with_newer_term_is_withheld_behind_term_adoption() {
+    // Follower at term 1 with a 3-entry log (indices 1..=3, all term 1).
+    let mut core = ReplicaCore::new(
+        NodeId(2),
+        [NodeId(1), NodeId(2), NodeId(3)].into(),
+        HardState {
+            current_term: Term(1),
+            voted_for: None,
+        },
+        entries(&[1, 1, 1]),
+        false,
+    );
+
+    // Leader at term 2 claims prev = (index 2, term 9): a term mismatch
+    // at a real position — the continuity check fails, refusal path.
+    let effects = core.on_message(
+        NodeId(1),
+        Message::AppendEntries {
+            term: Term(2),
+            leader: NodeId(1),
+            prev: LogPosition { term: 9, index: 2 },
+            entries: vec![],
+            commit: 0,
+        },
+        false,
+    );
+
+    // (a) The adopted term-2 hard state is staged for persist in the
+    // same effects batch.
+    let staged = effects.iter().any(|e| {
+        matches!(e, Effect::Persist { hard, .. }
+            if hard.current_term == Term(2) && hard.voted_for.is_none())
+    });
+    assert!(
+        staged,
+        "refusal under a newer term must stage the adopted hard state, got {effects:?}"
+    );
+
+    // (b) The refusal itself is WITHHELD: nothing is sent before the
+    // persist is confirmed.
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Send { .. })),
+        "refusal must not leave the node before the adopted term is durable, got {effects:?}"
+    );
+
+    // After the persist confirms, the withheld refusal surfaces with the
+    // adopted term and the backed-up hint: min(base+durable, prev-1)
+    // = min(0+3, 2-1) = 1.
+    let flushed = core.state_persisted();
+    let refusal_out = flushed.iter().any(|e| {
+        matches!(
+            e,
+            Effect::Send {
+                to: NodeId(1),
+                msg: Message::AppendResponse {
+                    term: Term(2),
+                    success: false,
+                    last_index: 1,
+                    unsupported: false,
+                },
+            }
+        )
+    });
+    assert!(
+        refusal_out,
+        "withheld refusal must surface after persist with the adopted term, got {flushed:?}"
+    );
+    assert_eq!(core.persisted_hard_state().current_term, Term(2));
+}
+
 /// R2, crash BEFORE persist: the vote decision (and its held response)
 /// evaporates — the original grant never left the node.
 #[test]
