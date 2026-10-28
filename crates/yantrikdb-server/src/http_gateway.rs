@@ -1303,6 +1303,41 @@ async fn yrp_backfill(
     })
 }
 
+/// One unreachable peer's row — transport failure and undecodable body
+/// degrade identically.
+fn yrp_topology_unreachable_node(id: u64, url: String) -> Value {
+    json!({ "node_id": id, "addr": url, "reachable": false, "self": false })
+}
+
+/// One peer's row: fetch its public `/v1/health` and project the
+/// cluster fields. Any failure (transport or decode) degrades to
+/// `reachable: false` — the dashboard renders the gap, not an error.
+async fn yrp_topology_peer_node(client: reqwest::Client, id: u64, url: String) -> Value {
+    let resp = match client
+        .get(format!("{}/v1/health", url.trim_end_matches('/')))
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(_) => return yrp_topology_unreachable_node(id, url),
+    };
+    let h = match resp.json::<Value>().await {
+        Ok(h) => h,
+        Err(_) => return yrp_topology_unreachable_node(id, url),
+    };
+    let c = h.get("cluster").cloned().unwrap_or(json!({}));
+    json!({
+        "node_id": id, "addr": url, "reachable": true, "self": false,
+        "role": c.get("role_label").or(c.get("role")),
+        "term": c.get("term"),
+        "leader": c.get("leader"),
+        "healthy": c.get("healthy"),
+        "last_applied_index": c.get("last_applied_index"),
+        "replication_lag": c.get("replication_lag_log_entries"),
+        "status": h.get("status"),
+    })
+}
+
 /// Admin studio: aggregated cluster topology. Fans out to every YRP
 /// member's `/v1/health` (public, like this endpoint) and returns one
 /// array the dashboard renders. Own-node state is read directly; peers
@@ -1343,33 +1378,7 @@ async fn yrp_topology(State(state): State<Arc<AppState>>) -> Json<Value> {
                     "replication_lag": v.as_ref().and_then(|c| c.replication_lag_log_entries),
                 })
             } else {
-                match client
-                    .get(format!("{}/v1/health", url.trim_end_matches('/')))
-                    .send()
-                    .await
-                {
-                    Ok(resp) => match resp.json::<Value>().await {
-                        Ok(h) => {
-                            let c = h.get("cluster").cloned().unwrap_or(json!({}));
-                            json!({
-                                "node_id": id, "addr": url, "reachable": true, "self": false,
-                                "role": c.get("role_label").or(c.get("role")),
-                                "term": c.get("term"),
-                                "leader": c.get("leader"),
-                                "healthy": c.get("healthy"),
-                                "last_applied_index": c.get("last_applied_index"),
-                                "replication_lag": c.get("replication_lag_log_entries"),
-                                "status": h.get("status"),
-                            })
-                        }
-                        Err(_) => {
-                            json!({ "node_id": id, "addr": url, "reachable": false, "self": false })
-                        }
-                    },
-                    Err(_) => {
-                        json!({ "node_id": id, "addr": url, "reachable": false, "self": false })
-                    }
-                }
+                yrp_topology_peer_node(client, id, url).await
             }
         }
     });
