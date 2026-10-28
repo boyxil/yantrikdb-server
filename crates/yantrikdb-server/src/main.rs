@@ -425,6 +425,996 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
+/// `yantrikdb db` subcommand handler (extracted from
+/// async_main's dispatch — all subcommands are synchronous,
+/// only `serve` awaits).
+fn cmd_db(action: DbAction, data_dir: PathBuf) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&data_dir)?;
+    let control = ControlDb::open(&data_dir.join("control.db"))?;
+
+    match action {
+        DbAction::Create { name } => {
+            if control.database_exists(&name)? {
+                eprintln!("database '{}' already exists", name);
+                std::process::exit(1);
+            }
+            let db_dir = data_dir.join(&name);
+            std::fs::create_dir_all(&db_dir)?;
+            let id = control.create_database(&name, &name)?;
+            println!("created database '{}' (id: {})", name, id);
+        }
+        DbAction::List => {
+            let databases = control.list_databases()?;
+            if databases.is_empty() {
+                println!("no databases");
+            } else {
+                println!("{:<6} {:<20} CREATED", "ID", "NAME");
+                for db in databases {
+                    println!("{:<6} {:<20} {}", db.id, db.name, db.created_at);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `yantrikdb token` subcommand handler (extracted from
+/// async_main's dispatch — all subcommands are synchronous,
+/// only `serve` awaits).
+fn cmd_token(action: TokenAction, data_dir: PathBuf) -> anyhow::Result<()> {
+    // Defensive: token operations always run AFTER `db create`,
+    // which would have created the data dir. If the data dir
+    // is missing, the most likely culprit on Windows/Git Bash
+    // is MSYS path translation rewriting a Linux-style path
+    // like `/var/lib/yantrikdb` into a Windows-prefixed path
+    // before docker exec sees it — silently creating control.db
+    // at a phantom location the running server can't see.
+    // Failing here makes that footgun loud instead of silent.
+    if !data_dir.exists() {
+        anyhow::bail!(
+            "data dir `{}` does not exist; token operations require an \
+                 initialized data dir (run `yantrikdb db --data-dir <path> create <name>` first). \
+                 On Windows + Git Bash, also try setting `MSYS_NO_PATHCONV=1` to disable \
+                 path translation when invoking via `docker exec`.",
+            data_dir.display()
+        );
+    }
+    let control = ControlDb::open(&data_dir.join("control.db"))?;
+
+    match action {
+        TokenAction::Create { db, label } => {
+            let db_record = control
+                .get_database(&db)?
+                .ok_or_else(|| anyhow::anyhow!("database '{}' not found", db))?;
+
+            let token = auth::generate_token();
+            let hash = auth::hash_token(&token);
+            control.create_token(&hash, db_record.id, &label)?;
+
+            println!("{}", token);
+            eprintln!(
+                "token created for database '{}' — save it now, it won't be shown again",
+                db
+            );
+        }
+        TokenAction::Revoke { token } => {
+            let hash = auth::hash_token(&token);
+            if control.revoke_token(&hash)? {
+                println!("token revoked");
+            } else {
+                eprintln!("token not found or already revoked");
+                std::process::exit(1);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `yantrikdb export` subcommand handler (extracted from
+/// async_main's dispatch — all subcommands are synchronous,
+/// only `serve` awaits).
+fn cmd_export(name: String, data_dir: PathBuf) -> anyhow::Result<()> {
+    let control = ControlDb::open(&data_dir.join("control.db"))?;
+    let db_record = control
+        .get_database(&name)?
+        .ok_or_else(|| anyhow::anyhow!("database '{}' not found", name))?;
+
+    let db_dir = data_dir.join(&db_record.path);
+    let db_path = db_dir.join("yantrik.db");
+
+    // Try to load encryption key from data dir if present
+    let key_file = data_dir.join("master.key");
+    let engine = if key_file.exists() {
+        let key_bytes = std::fs::read(&key_file)?;
+        if key_bytes.len() != 32 {
+            anyhow::bail!("master.key must be 32 bytes");
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&key_bytes);
+        yantrikdb::YantrikDB::new_encrypted(db_path.to_str().unwrap_or("yantrik.db"), 384, &key)?
+    } else {
+        yantrikdb::YantrikDB::new(db_path.to_str().unwrap_or("yantrik.db"), 384)?
+    };
+
+    // Export memories in pages
+    let page_size = 1000;
+    let mut offset = 0;
+    let mut total = 0;
+    loop {
+        let (memories, count) =
+            engine.list_memories(page_size, offset, None, None, None, "created_at")?;
+        if memories.is_empty() {
+            break;
+        }
+        for mem in &memories {
+            let row = serde_json::json!({
+                "type": "memory",
+                "rid": mem.rid,
+                "text": mem.text,
+                "memory_type": mem.memory_type,
+                "importance": mem.importance,
+                "valence": mem.valence,
+                "half_life": mem.half_life,
+                "created_at": mem.created_at,
+                "metadata": mem.metadata,
+                "namespace": mem.namespace,
+                "certainty": mem.certainty,
+                "domain": mem.domain,
+                "source": mem.source,
+                "emotional_state": mem.emotional_state,
+            });
+            println!("{}", serde_json::to_string(&row)?);
+            total += 1;
+        }
+        offset += page_size;
+        if memories.len() < page_size || offset >= count {
+            break;
+        }
+    }
+
+    // Export graph edges — get all entities and their edges
+    let entities = engine.search_entities(None, None, 100_000)?;
+    let mut edge_count = 0;
+    let mut seen_edges = std::collections::HashSet::new();
+    for entity in &entities {
+        let edges = engine.get_edges(&entity.name)?;
+        for edge in &edges {
+            if seen_edges.insert(edge.edge_id.clone()) {
+                let row = serde_json::json!({
+                    "type": "edge",
+                    "edge_id": edge.edge_id,
+                    "src": edge.src,
+                    "dst": edge.dst,
+                    "rel_type": edge.rel_type,
+                    "weight": edge.weight,
+                });
+                println!("{}", serde_json::to_string(&row)?);
+                edge_count += 1;
+            }
+        }
+    }
+
+    eprintln!(
+        "exported {} memories, {} edges from '{}'",
+        total, edge_count, name
+    );
+    Ok(())
+}
+
+/// `yantrikdb import` subcommand handler (extracted from
+/// async_main's dispatch — all subcommands are synchronous,
+/// only `serve` awaits).
+fn cmd_import(name: String, data_dir: PathBuf) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&data_dir)?;
+    let control = ControlDb::open(&data_dir.join("control.db"))?;
+
+    // Create database if it doesn't exist
+    if !control.database_exists(&name)? {
+        let db_dir = data_dir.join(&name);
+        std::fs::create_dir_all(&db_dir)?;
+        control.create_database(&name, &name)?;
+        eprintln!("created database '{}'", name);
+    }
+
+    let db_record = control
+        .get_database(&name)?
+        .ok_or_else(|| anyhow::anyhow!("database '{}' not found", name))?;
+
+    let db_dir = data_dir.join(&db_record.path);
+    std::fs::create_dir_all(&db_dir)?;
+    let db_path = db_dir.join("yantrik.db");
+
+    // Use encryption if a master.key exists in data_dir
+    let key_file = data_dir.join("master.key");
+    let mut engine = if key_file.exists() {
+        let key_bytes = std::fs::read(&key_file)?;
+        if key_bytes.len() != 32 {
+            anyhow::bail!("master.key must be 32 bytes");
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&key_bytes);
+        yantrikdb::YantrikDB::new_encrypted(db_path.to_str().unwrap_or("yantrik.db"), 384, &key)?
+    } else {
+        yantrikdb::YantrikDB::new(db_path.to_str().unwrap_or("yantrik.db"), 384)?
+    };
+
+    // Set up embedder for re-embedding. v0.7.20 made set_embedder
+    // fallible (dim validation).
+    let embedder = embedder::FastEmbedder::new()?;
+    engine.set_embedder(embedder.boxed())?;
+
+    let stdin = std::io::BufReader::new(std::io::stdin());
+    use std::io::BufRead;
+    let mut mem_count = 0;
+    let mut edge_count = 0;
+    let mut errors = 0;
+
+    for line in stdin.lines() {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+        let row: serde_json::Value = serde_json::from_str(&line)?;
+        let row_type = row["type"].as_str().unwrap_or("");
+
+        match row_type {
+            "memory" => {
+                let result = engine.record_text(
+                    row["text"].as_str().unwrap_or(""),
+                    row["memory_type"].as_str().unwrap_or("semantic"),
+                    row["importance"].as_f64().unwrap_or(0.5),
+                    row["valence"].as_f64().unwrap_or(0.0),
+                    row["half_life"].as_f64().unwrap_or(168.0),
+                    &row["metadata"],
+                    row["namespace"].as_str().unwrap_or(""),
+                    row["certainty"].as_f64().unwrap_or(1.0),
+                    row["domain"].as_str().unwrap_or(""),
+                    row["source"].as_str().unwrap_or("user"),
+                    row["emotional_state"].as_str(),
+                );
+                match result {
+                    Ok(_) => mem_count += 1,
+                    Err(e) => {
+                        eprintln!("error importing memory: {}", e);
+                        errors += 1;
+                    }
+                }
+            }
+            "edge" => {
+                let result = engine.relate(
+                    row["src"].as_str().unwrap_or(""),
+                    row["dst"].as_str().unwrap_or(""),
+                    row["rel_type"].as_str().unwrap_or(""),
+                    row["weight"].as_f64().unwrap_or(1.0),
+                );
+                match result {
+                    Ok(_) => edge_count += 1,
+                    Err(e) => {
+                        eprintln!("error importing edge: {}", e);
+                        errors += 1;
+                    }
+                }
+            }
+            _ => {
+                eprintln!("unknown row type: {}", row_type);
+                errors += 1;
+            }
+        }
+    }
+
+    eprintln!(
+        "imported {} memories, {} edges into '{}' ({} errors)",
+        mem_count, edge_count, name, errors
+    );
+    Ok(())
+}
+
+/// `yantrikdb cluster` subcommand handler (extracted from
+/// async_main's dispatch — all subcommands are synchronous,
+/// only `serve` awaits).
+fn cmd_cluster(action: ClusterAction) -> anyhow::Result<()> {
+    match action {
+        ClusterAction::Init {
+            node_id,
+            output,
+            data_dir,
+            wire_port,
+            http_port,
+            cluster_id,
+            peer,
+            witness,
+            secret,
+        } => {
+            // Parse `node_id@http_url` members.
+            fn parse_member(s: &str) -> anyhow::Result<(u64, String)> {
+                let (id, addr) = s.split_once('@').ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "member must be `node_id@http_url` (e.g. 1@http://10.0.0.1:7438), got `{s}`"
+                        )
+                    })?;
+                let id: u64 = id
+                    .trim()
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("bad node_id in `{s}`"))?;
+                Ok((id, addr.trim().to_string()))
+            }
+            let voters: Vec<(u64, String)> = peer
+                .iter()
+                .map(|s| parse_member(s))
+                .collect::<Result<_, _>>()?;
+            let witnesses: Vec<(u64, String)> = witness
+                .iter()
+                .map(|s| parse_member(s))
+                .collect::<Result<_, _>>()?;
+            if witnesses.len() > 1 {
+                anyhow::bail!("at most one witness is supported (RFC 028 §4)");
+            }
+            let is_witness = witnesses.iter().any(|(id, _)| *id as u32 == node_id);
+            if !is_witness && !voters.iter().any(|(id, _)| *id as u32 == node_id) {
+                anyhow::bail!("--node-id {node_id} must appear in --peer (voter) or --witness");
+            }
+            let secret = secret.unwrap_or_else(generate_cluster_secret);
+            let role = if is_witness { "witness" } else { "voter" };
+
+            let mut peers_toml = String::new();
+            for (id, addr) in voters.iter() {
+                peers_toml.push_str(&format!(
+                    "\n[[yrp.peers]]\nnode_id = {id}\naddr = \"{addr}\"\n"
+                ));
+            }
+            for (id, addr) in witnesses.iter() {
+                peers_toml.push_str(&format!(
+                    "\n[[yrp.peers]]\nnode_id = {id}\naddr = \"{addr}\"\nwitness = true\n"
+                ));
+            }
+
+            let toml = format!(
+                r#"# YantrikDB YRP cluster config (RFC 028) — generated by `yantrikdb cluster init`
+[server]
+wire_port = {wire_port}
+http_port = {http_port}
+data_dir = "{data_dir}"
+
+[cluster]
+node_id = {node_id}
+role = "{role}"
+raft_mode = "yrp"
+cluster_secret = "{secret}"
+
+[yrp]
+cluster_id = {cluster_id}
+tick_ms = 50
+election_ticks_min = 10
+election_ticks_max = 20
+heartbeat_ticks = 2
+{peers_toml}"#,
+                data_dir = data_dir.display(),
+            );
+
+            std::fs::write(&output, toml)?;
+            println!("YRP config written to {}", output.display());
+            println!();
+            println!("cluster_secret: {}", secret);
+            println!("(use this as the auth token from any client, on any node)");
+            println!();
+            println!("next steps:");
+            println!("  1. Re-run this command on every other node with the SAME");
+            println!("     --peer/--witness list and --secret, changing only --node-id.");
+            println!(
+                "  2. Start each node: yantrikdb serve --config {}",
+                output.display()
+            );
+            Ok(())
+        }
+        ClusterAction::Status { url, token } => {
+            // Hit both /v1/cluster (cluster topology) and
+            // /v1/health/deep (admission + runtime state added in
+            // RFC 009). The combined view is what operators
+            // actually want during incident triage.
+            let base = url.trim_end_matches('/');
+            let client = reqwest::blocking::Client::new();
+
+            let mut cluster_req = client.get(format!("{}/v1/cluster", base));
+            let mut health_req = client.get(format!("{}/v1/health/deep", base));
+            if let Some(ref t) = token {
+                let auth = format!("Bearer {}", t);
+                cluster_req = cluster_req.header("Authorization", &auth);
+                health_req = health_req.header("Authorization", auth);
+            }
+
+            let cluster_resp = cluster_req.send()?;
+            let cluster_status = cluster_resp.status();
+            let cluster_text = cluster_resp.text()?;
+            if !cluster_status.is_success() {
+                eprintln!("error {}: {}", cluster_status, cluster_text);
+                std::process::exit(1);
+            }
+            let cluster_value: serde_json::Value = serde_json::from_str(&cluster_text)?;
+
+            // /v1/health/deep is best-effort — if it errors, we
+            // still show cluster topology rather than failing.
+            let health_value: Option<serde_json::Value> = match health_req.send() {
+                Ok(r) if r.status().is_success() => {
+                    serde_json::from_str(&r.text().unwrap_or_default()).ok()
+                }
+                _ => None,
+            };
+
+            let combined = serde_json::json!({
+                "cluster": cluster_value,
+                "health": health_value,
+            });
+            println!("{}", serde_json::to_string_pretty(&combined)?);
+            Ok(())
+        }
+        ClusterAction::Promote { url, token } => {
+            let url = format!("{}/v1/cluster/promote", url.trim_end_matches('/'));
+            let resp = reqwest::blocking::Client::new()
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .send()?;
+            let status = resp.status();
+            let text = resp.text()?;
+            if !status.is_success() {
+                eprintln!("error {}: {}", status, text);
+                std::process::exit(1);
+            }
+            println!("{}", text);
+            Ok(())
+        }
+    }
+}
+
+/// `yantrikdb version` subcommand handler (extracted from
+/// async_main's dispatch — all subcommands are synchronous,
+/// only `serve` awaits).
+fn cmd_version(action: VersionAction) -> anyhow::Result<()> {
+    match action {
+        VersionAction::Local => {
+            let snap = crate::version::VersionSnapshot::local();
+            println!("YantrikDB version state (local build)");
+            println!("─────────────────────────────────────");
+            println!("  binary build id : {}", snap.build_id);
+            println!("  wire version    : {}", snap.wire);
+            println!("  min supported   : {}", snap.min_supported_wire);
+            println!();
+            println!("  Per-table schema versions:");
+            for (table, ver) in &snap.table_schema_versions {
+                println!("    {:<28} {}", table, ver);
+            }
+            Ok(())
+        }
+        VersionAction::Status { url, token, json } => {
+            let url = format!("{}/v1/health/deep", url.trim_end_matches('/'));
+            let mut req = reqwest::blocking::Client::new().get(&url);
+            if let Some(ref t) = token {
+                req = req.header("Authorization", format!("Bearer {}", t));
+            }
+            let resp = req.send()?;
+            let status = resp.status();
+            let text = resp.text()?;
+            if !status.is_success() {
+                eprintln!("error {}: {}", status, text);
+                std::process::exit(1);
+            }
+            let value: serde_json::Value = serde_json::from_str(&text)?;
+            let version = value.get("version");
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(version.unwrap_or(&serde_json::Value::Null))?
+                );
+                return Ok(());
+            }
+
+            let v = version.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "server response has no `version` block — likely a pre-RFC-017 build"
+                )
+            })?;
+
+            println!("YantrikDB version state (server)");
+            println!("─────────────────────────────────");
+            println!(
+                "  binary build id        : {}",
+                v["build_id"].as_str().unwrap_or("?")
+            );
+            println!(
+                "  local wire version     : {}.{}",
+                v["wire"]["major"].as_u64().unwrap_or(0),
+                v["wire"]["minor"].as_u64().unwrap_or(0),
+            );
+            println!(
+                "  min supported wire     : {}.{}",
+                v["min_supported_wire"]["major"].as_u64().unwrap_or(0),
+                v["min_supported_wire"]["minor"].as_u64().unwrap_or(0),
+            );
+            if let Some(cluster) = v.get("cluster") {
+                println!(
+                    "  cluster min wire       : {}.{}",
+                    cluster["min"]["major"].as_u64().unwrap_or(0),
+                    cluster["min"]["minor"].as_u64().unwrap_or(0),
+                );
+                println!(
+                    "  cluster max wire       : {}.{}",
+                    cluster["max"]["major"].as_u64().unwrap_or(0),
+                    cluster["max"]["minor"].as_u64().unwrap_or(0),
+                );
+                println!(
+                    "  observed peers         : {}",
+                    cluster["peer_count"].as_u64().unwrap_or(0)
+                );
+            }
+            if let Some(tables) = v.get("table_schema_versions").and_then(|t| t.as_array()) {
+                println!();
+                println!("  Per-table schema versions:");
+                for entry in tables {
+                    if let Some(arr) = entry.as_array() {
+                        if arr.len() == 2 {
+                            let name = arr[0].as_str().unwrap_or("?");
+                            let ver = arr[1].as_u64().unwrap_or(0);
+                            println!("    {:<28} v{}", name, ver);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `yantrikdb jobs` subcommand handler (extracted from
+/// async_main's dispatch — all subcommands are synchronous,
+/// only `serve` awaits).
+fn cmd_jobs(action: JobsAction) -> anyhow::Result<()> {
+    match action {
+        JobsAction::List {
+            url,
+            token,
+            tenant,
+            state,
+            limit,
+            json,
+        } => {
+            let mut url = format!("{}/v1/jobs?limit={}", url.trim_end_matches('/'), limit);
+            if let Some(t) = tenant {
+                url.push_str(&format!("&tenant={}", t));
+            }
+            if let Some(ref s) = state {
+                url.push_str(&format!("&state={}", s));
+            }
+            let resp = reqwest::blocking::Client::new()
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .send()?;
+            let status = resp.status();
+            let text = resp.text()?;
+            if !status.is_success() {
+                eprintln!("error {}: {}", status, text);
+                std::process::exit(1);
+            }
+            if json {
+                println!("{}", text);
+            } else {
+                let arr: serde_json::Value = serde_json::from_str(&text)?;
+                let jobs = arr.as_array();
+                let count = jobs.map(|a| a.len()).unwrap_or(0);
+                println!("Jobs: {}", count);
+                if let Some(jobs) = jobs {
+                    for j in jobs {
+                        let id = j["id"].as_str().unwrap_or("?");
+                        let kind = j["kind"].as_str().unwrap_or("?");
+                        let state = j["state"].as_str().unwrap_or("?");
+                        let pri = j["priority"].as_u64().unwrap_or(0);
+                        let tid = j["tenant_id"].as_i64().unwrap_or(0);
+                        println!(
+                            "  {} t={} pri={} {:<10} {}",
+                            &id[..8.min(id.len())],
+                            tid,
+                            pri,
+                            state,
+                            kind
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        JobsAction::Get {
+            url,
+            token,
+            job_id,
+            json,
+        } => {
+            let url = format!("{}/v1/jobs/{}", url.trim_end_matches('/'), job_id);
+            let resp = reqwest::blocking::Client::new()
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .send()?;
+            let status = resp.status();
+            let text = resp.text()?;
+            if !status.is_success() {
+                eprintln!("error {}: {}", status, text);
+                std::process::exit(1);
+            }
+            if json {
+                println!("{}", text);
+            } else {
+                let v: serde_json::Value = serde_json::from_str(&text)?;
+                println!("Job {}", v["id"].as_str().unwrap_or("?"));
+                println!("──────────");
+                println!("  tenant   : {}", v["tenant_id"].as_i64().unwrap_or(0));
+                println!("  kind     : {}", v["kind"].as_str().unwrap_or("?"));
+                println!("  state    : {}", v["state"].as_str().unwrap_or("?"));
+                println!("  priority : {}", v["priority"].as_u64().unwrap_or(0));
+                if let Some(leased) = v["leased_by"].as_str() {
+                    println!("  leased_by: {}", leased);
+                }
+                if let Some(err) = v["error_message"].as_str() {
+                    println!("  error    : {}", err);
+                }
+            }
+            Ok(())
+        }
+        JobsAction::Cancel { url, token, job_id } => {
+            let url = format!("{}/v1/jobs/{}", url.trim_end_matches('/'), job_id);
+            let resp = reqwest::blocking::Client::new()
+                .delete(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .send()?;
+            let status = resp.status();
+            let text = resp.text()?;
+            if !status.is_success() {
+                eprintln!("error {}: {}", status, text);
+                std::process::exit(1);
+            }
+            println!("✓ cancelled {}", job_id);
+            Ok(())
+        }
+    }
+}
+
+/// `yantrikdb migrations` subcommand handler (extracted from
+/// async_main's dispatch — all subcommands are synchronous,
+/// only `serve` awaits).
+fn cmd_migrations(action: MigrationsAction) -> anyhow::Result<()> {
+    match action {
+        MigrationsAction::Status { url, token, json } => {
+            let url = format!("{}/v1/admin/migrations", url.trim_end_matches('/'));
+            let resp = reqwest::blocking::Client::new()
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .send()?;
+            let status = resp.status();
+            let text = resp.text()?;
+            if !status.is_success() {
+                eprintln!("error {}: {}", status, text);
+                std::process::exit(1);
+            }
+            if json {
+                println!("{}", text);
+            } else {
+                let v: serde_json::Value = serde_json::from_str(&text)?;
+                println!("Schema migrations applied");
+                println!("─────────────────────────");
+                if let Some(obj) = v.as_object() {
+                    for (db, applied) in obj {
+                        println!("  [{}]", db);
+                        if let Some(arr) = applied.as_array() {
+                            for m in arr {
+                                println!(
+                                    "    m{:03} {}",
+                                    m["id"].as_u64().unwrap_or(0),
+                                    m["name"].as_str().unwrap_or("?")
+                                );
+                            }
+                        } else if let Some(err) = applied["error"].as_str() {
+                            println!("    error: {}", err);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `yantrikdb tls` subcommand handler (extracted from
+/// async_main's dispatch — all subcommands are synchronous,
+/// only `serve` awaits).
+fn cmd_tls(action: TlsAction) -> anyhow::Result<()> {
+    match action {
+        TlsAction::VerifyCluster { config } => {
+            // Load the config file, run cert_inspect, render report.
+            // Exits non-zero if any cert path is set but the file
+            // fails to load — which is what operators want to catch
+            // before a production cert rotation goes wrong.
+            let cfg = ServerConfig::load(&config)?;
+            let report = crate::security::cert_inspect::inspect(&cfg.cluster_tls);
+            println!("{}", report.render_human());
+
+            // If config claims to be fully specified but cert files
+            // don't load, surface that explicitly with non-zero exit.
+            if cfg.cluster_tls.is_fully_specified() {
+                let acceptor_result = crate::security::build_acceptor(&cfg.cluster_tls);
+                let connector_result = crate::security::build_connector(&cfg.cluster_tls);
+                let mut had_error = false;
+                if let Err(e) = acceptor_result {
+                    eprintln!("\n✗ acceptor build failed: {}", e);
+                    had_error = true;
+                }
+                if let Err(e) = connector_result {
+                    eprintln!("✗ connector build failed: {}", e);
+                    had_error = true;
+                }
+                if had_error {
+                    std::process::exit(1);
+                }
+                println!("\n✓ acceptor + connector both build successfully");
+                if cfg.cluster_tls.dev_mode {
+                    println!("\n⚠  WARNING: dev_mode is enabled. Peer cert chain verification");
+                    println!("   is SKIPPED. Never set this in production.");
+                }
+            } else {
+                println!(
+                    "\n(no certs configured — cluster_tls is opt-in until openraft mode lands)"
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `yantrikdb debug` subcommand handler (extracted from
+/// async_main's dispatch — all subcommands are synchronous,
+/// only `serve` awaits).
+fn cmd_debug(action: DebugAction) -> anyhow::Result<()> {
+    match action {
+        DebugAction::History {
+            url,
+            token,
+            tenant,
+            from,
+            limit,
+            json,
+        } => {
+            let url = format!(
+                "{}/v1/debug/history/{}?from={}&limit={}",
+                url.trim_end_matches('/'),
+                tenant,
+                from,
+                limit
+            );
+            let resp = reqwest::blocking::Client::new()
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .send()?;
+            let status = resp.status();
+            let text = resp.text()?;
+            if !status.is_success() {
+                eprintln!("error {}: {}", status, text);
+                std::process::exit(1);
+            }
+            if json {
+                println!("{}", text);
+            } else {
+                let v: serde_json::Value = serde_json::from_str(&text)?;
+                println!("YantrikDB commit log — tenant {}", tenant);
+                println!("──────────────────────────────────");
+                println!(
+                    "  high_watermark : {}",
+                    v["high_watermark"].as_u64().unwrap_or(0)
+                );
+                println!(
+                    "  from_index     : {}",
+                    v["from_index"].as_u64().unwrap_or(0)
+                );
+                println!(
+                    "  returned       : {}",
+                    v["entries"].as_array().map(|a| a.len()).unwrap_or(0)
+                );
+                println!();
+                if let Some(entries) = v["entries"].as_array() {
+                    for e in entries {
+                        let idx = e["log_index"].as_u64().unwrap_or(0);
+                        let term = e["term"].as_u64().unwrap_or(0);
+                        let kind = e["mutation"]["kind"].as_str().unwrap_or("?");
+                        let op_id = e["op_id"].as_str().unwrap_or("?");
+                        println!("  [{:>5}] term={:<3} {:<24} {}", idx, term, kind, op_id);
+                    }
+                }
+            }
+            Ok(())
+        }
+        DebugAction::FaultList { url, token, json } => {
+            let url = format!("{}/v1/debug/fault", url.trim_end_matches('/'));
+            let resp = reqwest::blocking::Client::new()
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .send()?;
+            let status = resp.status();
+            let text = resp.text()?;
+            if !status.is_success() {
+                eprintln!("error {}: {}", status, text);
+                std::process::exit(1);
+            }
+            if json {
+                println!("{}", text);
+            } else {
+                let faults: serde_json::Value = serde_json::from_str(&text)?;
+                let arr = faults.as_array();
+                let count = arr.map(|a| a.len()).unwrap_or(0);
+                println!("Active fault injections: {}", count);
+                if let Some(faults) = arr {
+                    for f in faults {
+                        let id = f["id"].as_u64().unwrap_or(0);
+                        let kind = f["kind"]["kind"].as_str().unwrap_or("?");
+                        let ttl = f["ttl_secs"].as_u64();
+                        match ttl {
+                            Some(t) => println!("  fault_{:<6} {:<20} ttl={}s", id, kind, t),
+                            None => println!("  fault_{:<6} {:<20} (persistent)", id, kind),
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        DebugAction::FaultClear { url, token } => {
+            let url = format!("{}/v1/debug/fault/clear", url.trim_end_matches('/'));
+            let resp = reqwest::blocking::Client::new()
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .send()?;
+            let status = resp.status();
+            let text = resp.text()?;
+            if !status.is_success() {
+                eprintln!("error {}: {}", status, text);
+                std::process::exit(1);
+            }
+            let v: serde_json::Value = serde_json::from_str(&text)?;
+            println!("cleared {} fault(s)", v["cleared"].as_u64().unwrap_or(0));
+            Ok(())
+        }
+    }
+}
+
+/// `yantrikdb admission` subcommand handler (extracted from
+/// async_main's dispatch — all subcommands are synchronous,
+/// only `serve` awaits).
+fn cmd_admission(action: AdmissionAction) -> anyhow::Result<()> {
+    match action {
+        AdmissionAction::Status { url, token, json } => {
+            let url = format!("{}/v1/health/deep", url.trim_end_matches('/'));
+            let mut req = reqwest::blocking::Client::new().get(&url);
+            if let Some(ref t) = token {
+                req = req.header("Authorization", format!("Bearer {}", t));
+            }
+            let resp = req.send()?;
+            let status = resp.status();
+            let text = resp.text()?;
+            if !status.is_success() {
+                eprintln!("error {}: {}", status, text);
+                std::process::exit(1);
+            }
+            let value: serde_json::Value = serde_json::from_str(&text)?;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        value.get("admission").unwrap_or(&serde_json::Value::Null)
+                    )?
+                );
+                return Ok(());
+            }
+
+            let admission = value.get("admission").ok_or_else(|| {
+                anyhow::anyhow!("server did not return admission state — older server version?")
+            })?;
+            let runtime = value.get("runtime");
+
+            println!("YantrikDB admission state (RFC 009)");
+            println!("───────────────────────────────────");
+            println!(
+                "  hard top_k cap          : {}",
+                admission["hard_top_k_cap"].as_u64().unwrap_or(0)
+            );
+            println!(
+                "  max request body bytes  : {}",
+                admission["max_request_body_bytes"].as_u64().unwrap_or(0)
+            );
+            let in_flight_max = admission["in_flight_recall"]["max"].as_u64().unwrap_or(0);
+            let in_flight_used = admission["in_flight_recall"]["in_use"]
+                .as_u64()
+                .unwrap_or(0);
+            println!(
+                "  in-flight recalls       : {}/{} ({}%)",
+                in_flight_used,
+                in_flight_max,
+                if in_flight_max > 0 {
+                    100 * in_flight_used / in_flight_max
+                } else {
+                    0
+                }
+            );
+            let expanded_max = admission["expanded_recall"]["max"].as_u64().unwrap_or(0);
+            let expanded_used = admission["expanded_recall"]["in_use"].as_u64().unwrap_or(0);
+            println!(
+                "  expanded concurrent     : {}/{} ({}%)",
+                expanded_used,
+                expanded_max,
+                if expanded_max > 0 {
+                    100 * expanded_used / expanded_max
+                } else {
+                    0
+                }
+            );
+            if let Some(rt) = runtime {
+                println!(
+                    "  control runtime isolated: {}",
+                    rt["control_runtime_isolated"].as_bool().unwrap_or(false)
+                );
+            }
+            println!();
+            println!("Tip: scrape /metrics for term changes, scheduling latency p99,");
+            println!("     and rejection counts (yantrikdb_recall_rejected_total).");
+            Ok(())
+        }
+    }
+}
+
+/// `yantrikdb encryption` subcommand handler (extracted from
+/// async_main's dispatch — all subcommands are synchronous,
+/// only `serve` awaits).
+fn cmd_encryption(action: EncryptionAction) -> anyhow::Result<()> {
+    match action {
+        EncryptionAction::GenKey { output } => {
+            use rand::RngCore;
+            if output.exists() {
+                eprintln!(
+                    "key file {} already exists — refusing to overwrite",
+                    output.display()
+                );
+                std::process::exit(1);
+            }
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut key = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut key);
+            std::fs::write(&output, key)?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600));
+            }
+
+            println!("master key written to {}", output.display());
+            println!();
+            println!("hex: {}", hex::encode(key));
+            println!();
+            println!("next steps:");
+            println!("  1. Add to yantrikdb.toml:");
+            println!("       [encryption]");
+            println!("       key_path = \"{}\"", output.display());
+            println!("  2. Or set env var: YANTRIKDB_ENCRYPTION_KEY_HEX=<hex>");
+            println!("  3. ⚠️  In a cluster, ALL nodes must use the SAME key");
+            println!("  4. ⚠️  Backup this key — losing it = losing all data");
+            Ok(())
+        }
+        EncryptionAction::ShowKey { input } => {
+            let bytes = std::fs::read(&input)?;
+            if bytes.len() != 32 {
+                anyhow::bail!("key file must be exactly 32 bytes (got {})", bytes.len());
+            }
+            println!("{}", hex::encode(&bytes));
+            Ok(())
+        }
+    }
+}
+
 async fn async_main() -> anyhow::Result<()> {
     // Structured logging. Set YANTRIKDB_LOG_JSON=1 for newline-delimited JSON
     // output (for log aggregators, grep-friendly ops). Default is human-readable.
@@ -486,956 +1476,29 @@ async fn async_main() -> anyhow::Result<()> {
             run_server(cfg).await
         }
 
-        Commands::Db { action, data_dir } => {
-            std::fs::create_dir_all(&data_dir)?;
-            let control = ControlDb::open(&data_dir.join("control.db"))?;
+        Commands::Db { action, data_dir } => cmd_db(action, data_dir),
 
-            match action {
-                DbAction::Create { name } => {
-                    if control.database_exists(&name)? {
-                        eprintln!("database '{}' already exists", name);
-                        std::process::exit(1);
-                    }
-                    let db_dir = data_dir.join(&name);
-                    std::fs::create_dir_all(&db_dir)?;
-                    let id = control.create_database(&name, &name)?;
-                    println!("created database '{}' (id: {})", name, id);
-                }
-                DbAction::List => {
-                    let databases = control.list_databases()?;
-                    if databases.is_empty() {
-                        println!("no databases");
-                    } else {
-                        println!("{:<6} {:<20} CREATED", "ID", "NAME");
-                        for db in databases {
-                            println!("{:<6} {:<20} {}", db.id, db.name, db.created_at);
-                        }
-                    }
-                }
-            }
-            Ok(())
-        }
+        Commands::Token { action, data_dir } => cmd_token(action, data_dir),
 
-        Commands::Token { action, data_dir } => {
-            // Defensive: token operations always run AFTER `db create`,
-            // which would have created the data dir. If the data dir
-            // is missing, the most likely culprit on Windows/Git Bash
-            // is MSYS path translation rewriting a Linux-style path
-            // like `/var/lib/yantrikdb` into a Windows-prefixed path
-            // before docker exec sees it — silently creating control.db
-            // at a phantom location the running server can't see.
-            // Failing here makes that footgun loud instead of silent.
-            if !data_dir.exists() {
-                anyhow::bail!(
-                    "data dir `{}` does not exist; token operations require an \
-                     initialized data dir (run `yantrikdb db --data-dir <path> create <name>` first). \
-                     On Windows + Git Bash, also try setting `MSYS_NO_PATHCONV=1` to disable \
-                     path translation when invoking via `docker exec`.",
-                    data_dir.display()
-                );
-            }
-            let control = ControlDb::open(&data_dir.join("control.db"))?;
+        Commands::Export { name, data_dir } => cmd_export(name, data_dir),
 
-            match action {
-                TokenAction::Create { db, label } => {
-                    let db_record = control
-                        .get_database(&db)?
-                        .ok_or_else(|| anyhow::anyhow!("database '{}' not found", db))?;
+        Commands::Import { name, data_dir } => cmd_import(name, data_dir),
 
-                    let token = auth::generate_token();
-                    let hash = auth::hash_token(&token);
-                    control.create_token(&hash, db_record.id, &label)?;
+        Commands::Cluster { action } => cmd_cluster(action),
 
-                    println!("{}", token);
-                    eprintln!(
-                        "token created for database '{}' — save it now, it won't be shown again",
-                        db
-                    );
-                }
-                TokenAction::Revoke { token } => {
-                    let hash = auth::hash_token(&token);
-                    if control.revoke_token(&hash)? {
-                        println!("token revoked");
-                    } else {
-                        eprintln!("token not found or already revoked");
-                        std::process::exit(1);
-                    }
-                }
-            }
-            Ok(())
-        }
+        Commands::Version { action } => cmd_version(action),
 
-        Commands::Export { name, data_dir } => {
-            let control = ControlDb::open(&data_dir.join("control.db"))?;
-            let db_record = control
-                .get_database(&name)?
-                .ok_or_else(|| anyhow::anyhow!("database '{}' not found", name))?;
+        Commands::Jobs { action } => cmd_jobs(action),
 
-            let db_dir = data_dir.join(&db_record.path);
-            let db_path = db_dir.join("yantrik.db");
+        Commands::Migrations { action } => cmd_migrations(action),
 
-            // Try to load encryption key from data dir if present
-            let key_file = data_dir.join("master.key");
-            let engine = if key_file.exists() {
-                let key_bytes = std::fs::read(&key_file)?;
-                if key_bytes.len() != 32 {
-                    anyhow::bail!("master.key must be 32 bytes");
-                }
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&key_bytes);
-                yantrikdb::YantrikDB::new_encrypted(
-                    db_path.to_str().unwrap_or("yantrik.db"),
-                    384,
-                    &key,
-                )?
-            } else {
-                yantrikdb::YantrikDB::new(db_path.to_str().unwrap_or("yantrik.db"), 384)?
-            };
+        Commands::Tls { action } => cmd_tls(action),
 
-            // Export memories in pages
-            let page_size = 1000;
-            let mut offset = 0;
-            let mut total = 0;
-            loop {
-                let (memories, count) =
-                    engine.list_memories(page_size, offset, None, None, None, "created_at")?;
-                if memories.is_empty() {
-                    break;
-                }
-                for mem in &memories {
-                    let row = serde_json::json!({
-                        "type": "memory",
-                        "rid": mem.rid,
-                        "text": mem.text,
-                        "memory_type": mem.memory_type,
-                        "importance": mem.importance,
-                        "valence": mem.valence,
-                        "half_life": mem.half_life,
-                        "created_at": mem.created_at,
-                        "metadata": mem.metadata,
-                        "namespace": mem.namespace,
-                        "certainty": mem.certainty,
-                        "domain": mem.domain,
-                        "source": mem.source,
-                        "emotional_state": mem.emotional_state,
-                    });
-                    println!("{}", serde_json::to_string(&row)?);
-                    total += 1;
-                }
-                offset += page_size;
-                if memories.len() < page_size || offset >= count {
-                    break;
-                }
-            }
+        Commands::Debug { action } => cmd_debug(action),
 
-            // Export graph edges — get all entities and their edges
-            let entities = engine.search_entities(None, None, 100_000)?;
-            let mut edge_count = 0;
-            let mut seen_edges = std::collections::HashSet::new();
-            for entity in &entities {
-                let edges = engine.get_edges(&entity.name)?;
-                for edge in &edges {
-                    if seen_edges.insert(edge.edge_id.clone()) {
-                        let row = serde_json::json!({
-                            "type": "edge",
-                            "edge_id": edge.edge_id,
-                            "src": edge.src,
-                            "dst": edge.dst,
-                            "rel_type": edge.rel_type,
-                            "weight": edge.weight,
-                        });
-                        println!("{}", serde_json::to_string(&row)?);
-                        edge_count += 1;
-                    }
-                }
-            }
+        Commands::Admission { action } => cmd_admission(action),
 
-            eprintln!(
-                "exported {} memories, {} edges from '{}'",
-                total, edge_count, name
-            );
-            Ok(())
-        }
-
-        Commands::Import { name, data_dir } => {
-            std::fs::create_dir_all(&data_dir)?;
-            let control = ControlDb::open(&data_dir.join("control.db"))?;
-
-            // Create database if it doesn't exist
-            if !control.database_exists(&name)? {
-                let db_dir = data_dir.join(&name);
-                std::fs::create_dir_all(&db_dir)?;
-                control.create_database(&name, &name)?;
-                eprintln!("created database '{}'", name);
-            }
-
-            let db_record = control
-                .get_database(&name)?
-                .ok_or_else(|| anyhow::anyhow!("database '{}' not found", name))?;
-
-            let db_dir = data_dir.join(&db_record.path);
-            std::fs::create_dir_all(&db_dir)?;
-            let db_path = db_dir.join("yantrik.db");
-
-            // Use encryption if a master.key exists in data_dir
-            let key_file = data_dir.join("master.key");
-            let mut engine = if key_file.exists() {
-                let key_bytes = std::fs::read(&key_file)?;
-                if key_bytes.len() != 32 {
-                    anyhow::bail!("master.key must be 32 bytes");
-                }
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&key_bytes);
-                yantrikdb::YantrikDB::new_encrypted(
-                    db_path.to_str().unwrap_or("yantrik.db"),
-                    384,
-                    &key,
-                )?
-            } else {
-                yantrikdb::YantrikDB::new(db_path.to_str().unwrap_or("yantrik.db"), 384)?
-            };
-
-            // Set up embedder for re-embedding. v0.7.20 made set_embedder
-            // fallible (dim validation).
-            let embedder = embedder::FastEmbedder::new()?;
-            engine.set_embedder(embedder.boxed())?;
-
-            let stdin = std::io::BufReader::new(std::io::stdin());
-            use std::io::BufRead;
-            let mut mem_count = 0;
-            let mut edge_count = 0;
-            let mut errors = 0;
-
-            for line in stdin.lines() {
-                let line = line?;
-                if line.is_empty() {
-                    continue;
-                }
-                let row: serde_json::Value = serde_json::from_str(&line)?;
-                let row_type = row["type"].as_str().unwrap_or("");
-
-                match row_type {
-                    "memory" => {
-                        let result = engine.record_text(
-                            row["text"].as_str().unwrap_or(""),
-                            row["memory_type"].as_str().unwrap_or("semantic"),
-                            row["importance"].as_f64().unwrap_or(0.5),
-                            row["valence"].as_f64().unwrap_or(0.0),
-                            row["half_life"].as_f64().unwrap_or(168.0),
-                            &row["metadata"],
-                            row["namespace"].as_str().unwrap_or(""),
-                            row["certainty"].as_f64().unwrap_or(1.0),
-                            row["domain"].as_str().unwrap_or(""),
-                            row["source"].as_str().unwrap_or("user"),
-                            row["emotional_state"].as_str(),
-                        );
-                        match result {
-                            Ok(_) => mem_count += 1,
-                            Err(e) => {
-                                eprintln!("error importing memory: {}", e);
-                                errors += 1;
-                            }
-                        }
-                    }
-                    "edge" => {
-                        let result = engine.relate(
-                            row["src"].as_str().unwrap_or(""),
-                            row["dst"].as_str().unwrap_or(""),
-                            row["rel_type"].as_str().unwrap_or(""),
-                            row["weight"].as_f64().unwrap_or(1.0),
-                        );
-                        match result {
-                            Ok(_) => edge_count += 1,
-                            Err(e) => {
-                                eprintln!("error importing edge: {}", e);
-                                errors += 1;
-                            }
-                        }
-                    }
-                    _ => {
-                        eprintln!("unknown row type: {}", row_type);
-                        errors += 1;
-                    }
-                }
-            }
-
-            eprintln!(
-                "imported {} memories, {} edges into '{}' ({} errors)",
-                mem_count, edge_count, name, errors
-            );
-            Ok(())
-        }
-
-        Commands::Cluster { action } => {
-            match action {
-                ClusterAction::Init {
-                    node_id,
-                    output,
-                    data_dir,
-                    wire_port,
-                    http_port,
-                    cluster_id,
-                    peer,
-                    witness,
-                    secret,
-                } => {
-                    // Parse `node_id@http_url` members.
-                    fn parse_member(s: &str) -> anyhow::Result<(u64, String)> {
-                        let (id, addr) = s.split_once('@').ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "member must be `node_id@http_url` (e.g. 1@http://10.0.0.1:7438), got `{s}`"
-                            )
-                        })?;
-                        let id: u64 = id
-                            .trim()
-                            .parse()
-                            .map_err(|_| anyhow::anyhow!("bad node_id in `{s}`"))?;
-                        Ok((id, addr.trim().to_string()))
-                    }
-                    let voters: Vec<(u64, String)> = peer
-                        .iter()
-                        .map(|s| parse_member(s))
-                        .collect::<Result<_, _>>()?;
-                    let witnesses: Vec<(u64, String)> = witness
-                        .iter()
-                        .map(|s| parse_member(s))
-                        .collect::<Result<_, _>>()?;
-                    if witnesses.len() > 1 {
-                        anyhow::bail!("at most one witness is supported (RFC 028 §4)");
-                    }
-                    let is_witness = witnesses.iter().any(|(id, _)| *id as u32 == node_id);
-                    if !is_witness && !voters.iter().any(|(id, _)| *id as u32 == node_id) {
-                        anyhow::bail!(
-                            "--node-id {node_id} must appear in --peer (voter) or --witness"
-                        );
-                    }
-                    let secret = secret.unwrap_or_else(generate_cluster_secret);
-                    let role = if is_witness { "witness" } else { "voter" };
-
-                    let mut peers_toml = String::new();
-                    for (id, addr) in voters.iter() {
-                        peers_toml.push_str(&format!(
-                            "\n[[yrp.peers]]\nnode_id = {id}\naddr = \"{addr}\"\n"
-                        ));
-                    }
-                    for (id, addr) in witnesses.iter() {
-                        peers_toml.push_str(&format!(
-                            "\n[[yrp.peers]]\nnode_id = {id}\naddr = \"{addr}\"\nwitness = true\n"
-                        ));
-                    }
-
-                    let toml = format!(
-                        r#"# YantrikDB YRP cluster config (RFC 028) — generated by `yantrikdb cluster init`
-[server]
-wire_port = {wire_port}
-http_port = {http_port}
-data_dir = "{data_dir}"
-
-[cluster]
-node_id = {node_id}
-role = "{role}"
-raft_mode = "yrp"
-cluster_secret = "{secret}"
-
-[yrp]
-cluster_id = {cluster_id}
-tick_ms = 50
-election_ticks_min = 10
-election_ticks_max = 20
-heartbeat_ticks = 2
-{peers_toml}"#,
-                        data_dir = data_dir.display(),
-                    );
-
-                    std::fs::write(&output, toml)?;
-                    println!("YRP config written to {}", output.display());
-                    println!();
-                    println!("cluster_secret: {}", secret);
-                    println!("(use this as the auth token from any client, on any node)");
-                    println!();
-                    println!("next steps:");
-                    println!("  1. Re-run this command on every other node with the SAME");
-                    println!("     --peer/--witness list and --secret, changing only --node-id.");
-                    println!(
-                        "  2. Start each node: yantrikdb serve --config {}",
-                        output.display()
-                    );
-                    Ok(())
-                }
-                ClusterAction::Status { url, token } => {
-                    // Hit both /v1/cluster (cluster topology) and
-                    // /v1/health/deep (admission + runtime state added in
-                    // RFC 009). The combined view is what operators
-                    // actually want during incident triage.
-                    let base = url.trim_end_matches('/');
-                    let client = reqwest::blocking::Client::new();
-
-                    let mut cluster_req = client.get(format!("{}/v1/cluster", base));
-                    let mut health_req = client.get(format!("{}/v1/health/deep", base));
-                    if let Some(ref t) = token {
-                        let auth = format!("Bearer {}", t);
-                        cluster_req = cluster_req.header("Authorization", &auth);
-                        health_req = health_req.header("Authorization", auth);
-                    }
-
-                    let cluster_resp = cluster_req.send()?;
-                    let cluster_status = cluster_resp.status();
-                    let cluster_text = cluster_resp.text()?;
-                    if !cluster_status.is_success() {
-                        eprintln!("error {}: {}", cluster_status, cluster_text);
-                        std::process::exit(1);
-                    }
-                    let cluster_value: serde_json::Value = serde_json::from_str(&cluster_text)?;
-
-                    // /v1/health/deep is best-effort — if it errors, we
-                    // still show cluster topology rather than failing.
-                    let health_value: Option<serde_json::Value> = match health_req.send() {
-                        Ok(r) if r.status().is_success() => {
-                            serde_json::from_str(&r.text().unwrap_or_default()).ok()
-                        }
-                        _ => None,
-                    };
-
-                    let combined = serde_json::json!({
-                        "cluster": cluster_value,
-                        "health": health_value,
-                    });
-                    println!("{}", serde_json::to_string_pretty(&combined)?);
-                    Ok(())
-                }
-                ClusterAction::Promote { url, token } => {
-                    let url = format!("{}/v1/cluster/promote", url.trim_end_matches('/'));
-                    let resp = reqwest::blocking::Client::new()
-                        .post(&url)
-                        .header("Authorization", format!("Bearer {}", token))
-                        .send()?;
-                    let status = resp.status();
-                    let text = resp.text()?;
-                    if !status.is_success() {
-                        eprintln!("error {}: {}", status, text);
-                        std::process::exit(1);
-                    }
-                    println!("{}", text);
-                    Ok(())
-                }
-            }
-        }
-
-        Commands::Version { action } => match action {
-            VersionAction::Local => {
-                let snap = crate::version::VersionSnapshot::local();
-                println!("YantrikDB version state (local build)");
-                println!("─────────────────────────────────────");
-                println!("  binary build id : {}", snap.build_id);
-                println!("  wire version    : {}", snap.wire);
-                println!("  min supported   : {}", snap.min_supported_wire);
-                println!();
-                println!("  Per-table schema versions:");
-                for (table, ver) in &snap.table_schema_versions {
-                    println!("    {:<28} {}", table, ver);
-                }
-                Ok(())
-            }
-            VersionAction::Status { url, token, json } => {
-                let url = format!("{}/v1/health/deep", url.trim_end_matches('/'));
-                let mut req = reqwest::blocking::Client::new().get(&url);
-                if let Some(ref t) = token {
-                    req = req.header("Authorization", format!("Bearer {}", t));
-                }
-                let resp = req.send()?;
-                let status = resp.status();
-                let text = resp.text()?;
-                if !status.is_success() {
-                    eprintln!("error {}: {}", status, text);
-                    std::process::exit(1);
-                }
-                let value: serde_json::Value = serde_json::from_str(&text)?;
-                let version = value.get("version");
-
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(version.unwrap_or(&serde_json::Value::Null))?
-                    );
-                    return Ok(());
-                }
-
-                let v = version.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "server response has no `version` block — likely a pre-RFC-017 build"
-                    )
-                })?;
-
-                println!("YantrikDB version state (server)");
-                println!("─────────────────────────────────");
-                println!(
-                    "  binary build id        : {}",
-                    v["build_id"].as_str().unwrap_or("?")
-                );
-                println!(
-                    "  local wire version     : {}.{}",
-                    v["wire"]["major"].as_u64().unwrap_or(0),
-                    v["wire"]["minor"].as_u64().unwrap_or(0),
-                );
-                println!(
-                    "  min supported wire     : {}.{}",
-                    v["min_supported_wire"]["major"].as_u64().unwrap_or(0),
-                    v["min_supported_wire"]["minor"].as_u64().unwrap_or(0),
-                );
-                if let Some(cluster) = v.get("cluster") {
-                    println!(
-                        "  cluster min wire       : {}.{}",
-                        cluster["min"]["major"].as_u64().unwrap_or(0),
-                        cluster["min"]["minor"].as_u64().unwrap_or(0),
-                    );
-                    println!(
-                        "  cluster max wire       : {}.{}",
-                        cluster["max"]["major"].as_u64().unwrap_or(0),
-                        cluster["max"]["minor"].as_u64().unwrap_or(0),
-                    );
-                    println!(
-                        "  observed peers         : {}",
-                        cluster["peer_count"].as_u64().unwrap_or(0)
-                    );
-                }
-                if let Some(tables) = v.get("table_schema_versions").and_then(|t| t.as_array()) {
-                    println!();
-                    println!("  Per-table schema versions:");
-                    for entry in tables {
-                        if let Some(arr) = entry.as_array() {
-                            if arr.len() == 2 {
-                                let name = arr[0].as_str().unwrap_or("?");
-                                let ver = arr[1].as_u64().unwrap_or(0);
-                                println!("    {:<28} v{}", name, ver);
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            }
-        },
-
-        Commands::Jobs { action } => match action {
-            JobsAction::List {
-                url,
-                token,
-                tenant,
-                state,
-                limit,
-                json,
-            } => {
-                let mut url = format!("{}/v1/jobs?limit={}", url.trim_end_matches('/'), limit);
-                if let Some(t) = tenant {
-                    url.push_str(&format!("&tenant={}", t));
-                }
-                if let Some(ref s) = state {
-                    url.push_str(&format!("&state={}", s));
-                }
-                let resp = reqwest::blocking::Client::new()
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .send()?;
-                let status = resp.status();
-                let text = resp.text()?;
-                if !status.is_success() {
-                    eprintln!("error {}: {}", status, text);
-                    std::process::exit(1);
-                }
-                if json {
-                    println!("{}", text);
-                } else {
-                    let arr: serde_json::Value = serde_json::from_str(&text)?;
-                    let jobs = arr.as_array();
-                    let count = jobs.map(|a| a.len()).unwrap_or(0);
-                    println!("Jobs: {}", count);
-                    if let Some(jobs) = jobs {
-                        for j in jobs {
-                            let id = j["id"].as_str().unwrap_or("?");
-                            let kind = j["kind"].as_str().unwrap_or("?");
-                            let state = j["state"].as_str().unwrap_or("?");
-                            let pri = j["priority"].as_u64().unwrap_or(0);
-                            let tid = j["tenant_id"].as_i64().unwrap_or(0);
-                            println!(
-                                "  {} t={} pri={} {:<10} {}",
-                                &id[..8.min(id.len())],
-                                tid,
-                                pri,
-                                state,
-                                kind
-                            );
-                        }
-                    }
-                }
-                Ok(())
-            }
-            JobsAction::Get {
-                url,
-                token,
-                job_id,
-                json,
-            } => {
-                let url = format!("{}/v1/jobs/{}", url.trim_end_matches('/'), job_id);
-                let resp = reqwest::blocking::Client::new()
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .send()?;
-                let status = resp.status();
-                let text = resp.text()?;
-                if !status.is_success() {
-                    eprintln!("error {}: {}", status, text);
-                    std::process::exit(1);
-                }
-                if json {
-                    println!("{}", text);
-                } else {
-                    let v: serde_json::Value = serde_json::from_str(&text)?;
-                    println!("Job {}", v["id"].as_str().unwrap_or("?"));
-                    println!("──────────");
-                    println!("  tenant   : {}", v["tenant_id"].as_i64().unwrap_or(0));
-                    println!("  kind     : {}", v["kind"].as_str().unwrap_or("?"));
-                    println!("  state    : {}", v["state"].as_str().unwrap_or("?"));
-                    println!("  priority : {}", v["priority"].as_u64().unwrap_or(0));
-                    if let Some(leased) = v["leased_by"].as_str() {
-                        println!("  leased_by: {}", leased);
-                    }
-                    if let Some(err) = v["error_message"].as_str() {
-                        println!("  error    : {}", err);
-                    }
-                }
-                Ok(())
-            }
-            JobsAction::Cancel { url, token, job_id } => {
-                let url = format!("{}/v1/jobs/{}", url.trim_end_matches('/'), job_id);
-                let resp = reqwest::blocking::Client::new()
-                    .delete(&url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .send()?;
-                let status = resp.status();
-                let text = resp.text()?;
-                if !status.is_success() {
-                    eprintln!("error {}: {}", status, text);
-                    std::process::exit(1);
-                }
-                println!("✓ cancelled {}", job_id);
-                Ok(())
-            }
-        },
-
-        Commands::Migrations { action } => match action {
-            MigrationsAction::Status { url, token, json } => {
-                let url = format!("{}/v1/admin/migrations", url.trim_end_matches('/'));
-                let resp = reqwest::blocking::Client::new()
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .send()?;
-                let status = resp.status();
-                let text = resp.text()?;
-                if !status.is_success() {
-                    eprintln!("error {}: {}", status, text);
-                    std::process::exit(1);
-                }
-                if json {
-                    println!("{}", text);
-                } else {
-                    let v: serde_json::Value = serde_json::from_str(&text)?;
-                    println!("Schema migrations applied");
-                    println!("─────────────────────────");
-                    if let Some(obj) = v.as_object() {
-                        for (db, applied) in obj {
-                            println!("  [{}]", db);
-                            if let Some(arr) = applied.as_array() {
-                                for m in arr {
-                                    println!(
-                                        "    m{:03} {}",
-                                        m["id"].as_u64().unwrap_or(0),
-                                        m["name"].as_str().unwrap_or("?")
-                                    );
-                                }
-                            } else if let Some(err) = applied["error"].as_str() {
-                                println!("    error: {}", err);
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            }
-        },
-
-        Commands::Tls { action } => match action {
-            TlsAction::VerifyCluster { config } => {
-                // Load the config file, run cert_inspect, render report.
-                // Exits non-zero if any cert path is set but the file
-                // fails to load — which is what operators want to catch
-                // before a production cert rotation goes wrong.
-                let cfg = ServerConfig::load(&config)?;
-                let report = crate::security::cert_inspect::inspect(&cfg.cluster_tls);
-                println!("{}", report.render_human());
-
-                // If config claims to be fully specified but cert files
-                // don't load, surface that explicitly with non-zero exit.
-                if cfg.cluster_tls.is_fully_specified() {
-                    let acceptor_result = crate::security::build_acceptor(&cfg.cluster_tls);
-                    let connector_result = crate::security::build_connector(&cfg.cluster_tls);
-                    let mut had_error = false;
-                    if let Err(e) = acceptor_result {
-                        eprintln!("\n✗ acceptor build failed: {}", e);
-                        had_error = true;
-                    }
-                    if let Err(e) = connector_result {
-                        eprintln!("✗ connector build failed: {}", e);
-                        had_error = true;
-                    }
-                    if had_error {
-                        std::process::exit(1);
-                    }
-                    println!("\n✓ acceptor + connector both build successfully");
-                    if cfg.cluster_tls.dev_mode {
-                        println!("\n⚠  WARNING: dev_mode is enabled. Peer cert chain verification");
-                        println!("   is SKIPPED. Never set this in production.");
-                    }
-                } else {
-                    println!(
-                        "\n(no certs configured — cluster_tls is opt-in until openraft mode lands)"
-                    );
-                }
-                Ok(())
-            }
-        },
-
-        Commands::Debug { action } => match action {
-            DebugAction::History {
-                url,
-                token,
-                tenant,
-                from,
-                limit,
-                json,
-            } => {
-                let url = format!(
-                    "{}/v1/debug/history/{}?from={}&limit={}",
-                    url.trim_end_matches('/'),
-                    tenant,
-                    from,
-                    limit
-                );
-                let resp = reqwest::blocking::Client::new()
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .send()?;
-                let status = resp.status();
-                let text = resp.text()?;
-                if !status.is_success() {
-                    eprintln!("error {}: {}", status, text);
-                    std::process::exit(1);
-                }
-                if json {
-                    println!("{}", text);
-                } else {
-                    let v: serde_json::Value = serde_json::from_str(&text)?;
-                    println!("YantrikDB commit log — tenant {}", tenant);
-                    println!("──────────────────────────────────");
-                    println!(
-                        "  high_watermark : {}",
-                        v["high_watermark"].as_u64().unwrap_or(0)
-                    );
-                    println!(
-                        "  from_index     : {}",
-                        v["from_index"].as_u64().unwrap_or(0)
-                    );
-                    println!(
-                        "  returned       : {}",
-                        v["entries"].as_array().map(|a| a.len()).unwrap_or(0)
-                    );
-                    println!();
-                    if let Some(entries) = v["entries"].as_array() {
-                        for e in entries {
-                            let idx = e["log_index"].as_u64().unwrap_or(0);
-                            let term = e["term"].as_u64().unwrap_or(0);
-                            let kind = e["mutation"]["kind"].as_str().unwrap_or("?");
-                            let op_id = e["op_id"].as_str().unwrap_or("?");
-                            println!("  [{:>5}] term={:<3} {:<24} {}", idx, term, kind, op_id);
-                        }
-                    }
-                }
-                Ok(())
-            }
-            DebugAction::FaultList { url, token, json } => {
-                let url = format!("{}/v1/debug/fault", url.trim_end_matches('/'));
-                let resp = reqwest::blocking::Client::new()
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .send()?;
-                let status = resp.status();
-                let text = resp.text()?;
-                if !status.is_success() {
-                    eprintln!("error {}: {}", status, text);
-                    std::process::exit(1);
-                }
-                if json {
-                    println!("{}", text);
-                } else {
-                    let faults: serde_json::Value = serde_json::from_str(&text)?;
-                    let arr = faults.as_array();
-                    let count = arr.map(|a| a.len()).unwrap_or(0);
-                    println!("Active fault injections: {}", count);
-                    if let Some(faults) = arr {
-                        for f in faults {
-                            let id = f["id"].as_u64().unwrap_or(0);
-                            let kind = f["kind"]["kind"].as_str().unwrap_or("?");
-                            let ttl = f["ttl_secs"].as_u64();
-                            match ttl {
-                                Some(t) => println!("  fault_{:<6} {:<20} ttl={}s", id, kind, t),
-                                None => println!("  fault_{:<6} {:<20} (persistent)", id, kind),
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            }
-            DebugAction::FaultClear { url, token } => {
-                let url = format!("{}/v1/debug/fault/clear", url.trim_end_matches('/'));
-                let resp = reqwest::blocking::Client::new()
-                    .post(&url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .send()?;
-                let status = resp.status();
-                let text = resp.text()?;
-                if !status.is_success() {
-                    eprintln!("error {}: {}", status, text);
-                    std::process::exit(1);
-                }
-                let v: serde_json::Value = serde_json::from_str(&text)?;
-                println!("cleared {} fault(s)", v["cleared"].as_u64().unwrap_or(0));
-                Ok(())
-            }
-        },
-
-        Commands::Admission { action } => match action {
-            AdmissionAction::Status { url, token, json } => {
-                let url = format!("{}/v1/health/deep", url.trim_end_matches('/'));
-                let mut req = reqwest::blocking::Client::new().get(&url);
-                if let Some(ref t) = token {
-                    req = req.header("Authorization", format!("Bearer {}", t));
-                }
-                let resp = req.send()?;
-                let status = resp.status();
-                let text = resp.text()?;
-                if !status.is_success() {
-                    eprintln!("error {}: {}", status, text);
-                    std::process::exit(1);
-                }
-                let value: serde_json::Value = serde_json::from_str(&text)?;
-
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(
-                            value.get("admission").unwrap_or(&serde_json::Value::Null)
-                        )?
-                    );
-                    return Ok(());
-                }
-
-                let admission = value.get("admission").ok_or_else(|| {
-                    anyhow::anyhow!("server did not return admission state — older server version?")
-                })?;
-                let runtime = value.get("runtime");
-
-                println!("YantrikDB admission state (RFC 009)");
-                println!("───────────────────────────────────");
-                println!(
-                    "  hard top_k cap          : {}",
-                    admission["hard_top_k_cap"].as_u64().unwrap_or(0)
-                );
-                println!(
-                    "  max request body bytes  : {}",
-                    admission["max_request_body_bytes"].as_u64().unwrap_or(0)
-                );
-                let in_flight_max = admission["in_flight_recall"]["max"].as_u64().unwrap_or(0);
-                let in_flight_used = admission["in_flight_recall"]["in_use"]
-                    .as_u64()
-                    .unwrap_or(0);
-                println!(
-                    "  in-flight recalls       : {}/{} ({}%)",
-                    in_flight_used,
-                    in_flight_max,
-                    if in_flight_max > 0 {
-                        100 * in_flight_used / in_flight_max
-                    } else {
-                        0
-                    }
-                );
-                let expanded_max = admission["expanded_recall"]["max"].as_u64().unwrap_or(0);
-                let expanded_used = admission["expanded_recall"]["in_use"].as_u64().unwrap_or(0);
-                println!(
-                    "  expanded concurrent     : {}/{} ({}%)",
-                    expanded_used,
-                    expanded_max,
-                    if expanded_max > 0 {
-                        100 * expanded_used / expanded_max
-                    } else {
-                        0
-                    }
-                );
-                if let Some(rt) = runtime {
-                    println!(
-                        "  control runtime isolated: {}",
-                        rt["control_runtime_isolated"].as_bool().unwrap_or(false)
-                    );
-                }
-                println!();
-                println!("Tip: scrape /metrics for term changes, scheduling latency p99,");
-                println!("     and rejection counts (yantrikdb_recall_rejected_total).");
-                Ok(())
-            }
-        },
-
-        Commands::Encryption { action } => match action {
-            EncryptionAction::GenKey { output } => {
-                use rand::RngCore;
-                if output.exists() {
-                    eprintln!(
-                        "key file {} already exists — refusing to overwrite",
-                        output.display()
-                    );
-                    std::process::exit(1);
-                }
-                if let Some(parent) = output.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let mut key = [0u8; 32];
-                rand::thread_rng().fill_bytes(&mut key);
-                std::fs::write(&output, key)?;
-
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ =
-                        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600));
-                }
-
-                println!("master key written to {}", output.display());
-                println!();
-                println!("hex: {}", hex::encode(key));
-                println!();
-                println!("next steps:");
-                println!("  1. Add to yantrikdb.toml:");
-                println!("       [encryption]");
-                println!("       key_path = \"{}\"", output.display());
-                println!("  2. Or set env var: YANTRIKDB_ENCRYPTION_KEY_HEX=<hex>");
-                println!("  3. ⚠️  In a cluster, ALL nodes must use the SAME key");
-                println!("  4. ⚠️  Backup this key — losing it = losing all data");
-                Ok(())
-            }
-            EncryptionAction::ShowKey { input } => {
-                let bytes = std::fs::read(&input)?;
-                if bytes.len() != 32 {
-                    anyhow::bail!("key file must be exactly 32 bytes (got {})", bytes.len());
-                }
-                println!("{}", hex::encode(&bytes));
-                Ok(())
-            }
-        },
+        Commands::Encryption { action } => cmd_encryption(action),
     }
 }
 
