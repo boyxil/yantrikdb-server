@@ -323,6 +323,13 @@ pub fn embedding(seed: f32) -> Value {
 
 /// Keyed remember against whichever node currently accepts it; retries
 /// across nodes until a 200 lands. Returns (rid, node_index).
+///
+/// The 120s deadline is PROGRESS headroom, not the tested invariant —
+/// the chaos tests assert the write-latency-free property downstream
+/// (a key is accepted at most once). Re-election under a starved
+/// runner legitimately exceeds 30s: two full-battery runs at load
+/// average 5–8 tripped the old 30s bound while the dedupe invariant
+/// held, so the bound is generous on purpose.
 pub async fn keyed_write_until_accepted(
     nodes: &[&TestNode],
     key: &str,
@@ -330,7 +337,7 @@ pub async fn keyed_write_until_accepted(
     emb: &Value,
 ) -> (String, usize) {
     let body = json!({ "text": text, "embedding": emb, "idempotency_key": key });
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
         for (i, n) in nodes.iter().enumerate() {
             let (st, resp) = post_json(n, "/v1/remember", &body).await;
