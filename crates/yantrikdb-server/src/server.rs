@@ -307,30 +307,65 @@ where
 
         match frame_to_command(&frame) {
             Ok(cmd) => {
-                if is_write_command(&cmd) {
-                    if let Some((leader, _mode)) = write_denial(&state) {
-                        let msg = leader
-                            .map(|id| format!("not the leader (current leader: node {})", id))
-                            .unwrap_or_else(|| "no leader elected (cluster not ready)".into());
-                        let err = make_error(stream_id, error_codes::READONLY_NODE, msg)?;
-                        framed.send(err).await?;
-                        continue;
-                    }
-                }
-
-                let response_frames =
-                    dispatch_command(std::sync::Arc::clone(&engine), &state, cmd, stream_id).await;
-                for f in response_frames {
-                    framed.send(f).await?;
-                }
+                handle_command(&mut framed, &state, &engine, cmd, stream_id).await?;
             }
             Err(e) => {
                 let err_frame = make_error(stream_id, error_codes::INVALID_PAYLOAD, e.to_string())?;
-                framed.send(err_frame).await?;
+                send_frames(&mut framed, vec![err_frame]).await?;
             }
         }
     }
 
+    Ok(())
+}
+
+/// Write-gate + blocking dispatch + response writeback for one decoded
+/// command frame.
+async fn handle_command<S>(
+    framed: &mut Framed<S, YantrikCodec>,
+    state: &AppState,
+    engine: &std::sync::Arc<yantrikdb::YantrikDB>,
+    cmd: Command,
+    stream_id: u32,
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    if let Some((leader, _mode)) = write_denial_for(state, &cmd) {
+        let msg = leader
+            .map(|id| format!("not the leader (current leader: node {})", id))
+            .unwrap_or_else(|| "no leader elected (cluster not ready)".into());
+        let err = make_error(stream_id, error_codes::READONLY_NODE, msg)?;
+        send_frames(framed, vec![err]).await?;
+        return Ok(());
+    }
+
+    let response_frames =
+        dispatch_command(std::sync::Arc::clone(engine), state, cmd, stream_id).await;
+    send_frames(framed, response_frames).await
+}
+
+/// The replication write gate, applied only to write commands (reads
+/// flow on any node).
+fn write_denial_for(state: &AppState, cmd: &Command) -> Option<(Option<u64>, &'static str)> {
+    if is_write_command(cmd) {
+        write_denial(state)
+    } else {
+        None
+    }
+}
+
+/// Write every response frame back to the connection, in order.
+async fn send_frames<S>(
+    framed: &mut Framed<S, YantrikCodec>,
+    frames: Vec<Frame>,
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    for f in frames {
+        framed.send(f).await?;
+    }
     Ok(())
 }
 

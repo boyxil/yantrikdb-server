@@ -78,6 +78,55 @@ impl EmbeddingSection {
     }
 }
 
+/// Decode a 64-char hex string into a 32-byte master key.
+fn decode_key_hex(hex_str: &str) -> anyhow::Result<[u8; 32]> {
+    let bytes = hex::decode(hex_str)?;
+    if bytes.len() != 32 {
+        anyhow::bail!("key must decode to exactly 32 bytes (got {})", bytes.len());
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    Ok(key)
+}
+
+/// Load a 32-byte master key from disk.
+fn read_key_file(path: &Path) -> anyhow::Result<[u8; 32]> {
+    let bytes = std::fs::read(path)?;
+    if bytes.len() != 32 {
+        anyhow::bail!(
+            "key file at {} must be exactly 32 bytes (got {})",
+            path.display(),
+            bytes.len()
+        );
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    Ok(key)
+}
+
+/// Generate a fresh 32-byte master key, persist it 0600, return it.
+fn write_generated_key(path: &Path) -> anyhow::Result<[u8; 32]> {
+    use rand::RngCore;
+    let mut key = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut key);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, key)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    tracing::info!(
+        path = %path.display(),
+        "auto-generated encryption master key"
+    );
+    Ok(key)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 #[derive(Default)]
@@ -122,83 +171,50 @@ impl EncryptionSection {
     }
 
     /// Resolve the master key from this configuration. Generates one if needed.
+    /// Priority: env var (issue #6) → TOML hex → key file → auto-generate.
     pub fn resolve_key(&self, data_dir: &Path) -> anyhow::Result<Option<[u8; 32]>> {
-        // Priority 0: env var override (issue #6 — env-friendly setup).
-        // Documented as the env-equivalent of `[encryption] key_hex`. Takes
-        // precedence over TOML so an operator can rotate the key without
-        // editing the file.
-        if let Ok(hex_str) = std::env::var("YANTRIKDB_ENCRYPTION_KEY_HEX") {
-            let bytes = hex::decode(hex_str.trim())
-                .map_err(|e| anyhow::anyhow!("invalid YANTRIKDB_ENCRYPTION_KEY_HEX: {}", e))?;
-            if bytes.len() != 32 {
-                anyhow::bail!(
-                    "YANTRIKDB_ENCRYPTION_KEY_HEX must decode to exactly 32 bytes (got {})",
-                    bytes.len()
-                );
-            }
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&bytes);
-            tracing::info!("encryption: enabled via YANTRIKDB_ENCRYPTION_KEY_HEX env var");
+        if let Some(key) = self.resolve_env_key()? {
             return Ok(Some(key));
         }
-
-        // Priority 1: explicit hex value in TOML
-        if let Some(ref hex_str) = self.key_hex {
-            let bytes = hex::decode(hex_str)
-                .map_err(|e| anyhow::anyhow!("invalid encryption.key_hex: {}", e))?;
-            if bytes.len() != 32 {
-                anyhow::bail!("encryption.key_hex must decode to exactly 32 bytes");
-            }
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&bytes);
+        if let Some(key) = self.resolve_toml_key()? {
             return Ok(Some(key));
         }
-
-        // Priority 2: explicit key file
         let path = match &self.key_path {
             Some(p) => p.clone(),
             None if self.auto_generate => data_dir.join("master.key"),
             None => return Ok(None),
         };
-
         if path.exists() {
-            let bytes = std::fs::read(&path)?;
-            if bytes.len() != 32 {
-                anyhow::bail!(
-                    "key file at {} must be exactly 32 bytes (got {})",
-                    path.display(),
-                    bytes.len()
-                );
-            }
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&bytes);
-            return Ok(Some(key));
+            return Ok(Some(read_key_file(&path)?));
         }
-
-        // Auto-generate
         if self.auto_generate {
-            use rand::RngCore;
-            let mut key = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut key);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&path, key)?;
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-            }
-
-            tracing::info!(
-                path = %path.display(),
-                "auto-generated encryption master key"
-            );
-            return Ok(Some(key));
+            return Ok(Some(write_generated_key(&path)?));
         }
-
         Ok(None)
+    }
+
+    /// Priority 0: env var override (issue #6 — env-friendly setup).
+    /// Documented as the env-equivalent of `[encryption] key_hex`. Takes
+    /// precedence over TOML so an operator can rotate the key without
+    /// editing the file.
+    fn resolve_env_key(&self) -> anyhow::Result<Option<[u8; 32]>> {
+        let Ok(hex_str) = std::env::var("YANTRIKDB_ENCRYPTION_KEY_HEX") else {
+            return Ok(None);
+        };
+        let key = decode_key_hex(hex_str.trim())
+            .map_err(|e| anyhow::anyhow!("invalid YANTRIKDB_ENCRYPTION_KEY_HEX: {}", e))?;
+        tracing::info!("encryption: enabled via YANTRIKDB_ENCRYPTION_KEY_HEX env var");
+        Ok(Some(key))
+    }
+
+    /// Priority 1: explicit hex value in TOML.
+    fn resolve_toml_key(&self) -> anyhow::Result<Option<[u8; 32]>> {
+        match &self.key_hex {
+            Some(hex_str) => decode_key_hex(hex_str)
+                .map_err(|e| anyhow::anyhow!("invalid encryption.key_hex: {}", e))
+                .map(Some),
+            None => Ok(None),
+        }
     }
 }
 
