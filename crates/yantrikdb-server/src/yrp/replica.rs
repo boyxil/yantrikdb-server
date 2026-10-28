@@ -1058,6 +1058,91 @@ impl ReplicaCore {
 
     // ── log replication (Phase A1b) ────────────────────────────────
 
+    /// Convenience: an AppendResponse effect to one peer.
+    fn append_response(
+        to: NodeId,
+        term: Term,
+        success: bool,
+        last_index: u64,
+        unsupported: bool,
+    ) -> Effect {
+        Effect::Send {
+            to,
+            msg: Message::AppendResponse {
+                term,
+                success,
+                last_index,
+                unsupported,
+            },
+        }
+    }
+
+    /// Route `resp` through the durable-staging path: a newer term first
+    /// stages the adopted hard state (one decision → one persist — the
+    /// A1 split-persist lesson) and WITHHOLDS the response on that
+    /// snapshot; at the current term the durable state already covers
+    /// it, so the response can go out directly.
+    fn staged_response(
+        &mut self,
+        adopted: HardState,
+        newer: bool,
+        resp: Effect,
+        effects: &mut Vec<Effect>,
+    ) {
+        if newer {
+            effects.push(self.stage(adopted));
+            self.hold(resp);
+        } else {
+            self.hold_or(resp, effects);
+        }
+    }
+
+    /// Append `entries` after `prev_index`, truncating any conflicting
+    /// (necessarily uncommitted) suffix and maintaining the idempotency
+    /// claims map (a claim dies WITH its truncated entry — the atomic
+    /// unit, RFC 028 §7: keys owned by the removed suffix are dropped so
+    /// a re-proposed key can claim afresh). Returns `(end_index,
+    /// changed)`, or `None` when a conflict lands at/below the commit
+    /// index — protocol corruption; the caller fails closed rather than
+    /// destroy applied history (Phase A2 turns this into quarantine).
+    fn append_or_truncate(&mut self, prev_index: u64, entries: &[LogEntry]) -> Option<(u64, bool)> {
+        let mut idx = prev_index;
+        let mut changed = false;
+        for e in entries {
+            idx += 1;
+            match self.entry(idx) {
+                Some(existing) if *existing == *e => {}
+                Some(_) => {
+                    if idx <= self.commit {
+                        debug_assert!(false, "conflict at/below commit index — corruption");
+                        return None;
+                    }
+                    for removed in self.log.iter().skip((idx - self.base.index) as usize - 1) {
+                        if let Some(k) = removed.key {
+                            if self.claims.get(&k) >= Some(&idx) {
+                                self.claims.remove(&k);
+                            }
+                        }
+                    }
+                    self.log.truncate((idx - self.base.index) as usize - 1);
+                    self.log.push(e.clone());
+                    if let Some(k) = e.key {
+                        self.claims.insert(k, idx);
+                    }
+                    changed = true;
+                }
+                None => {
+                    self.log.push(e.clone());
+                    if let Some(k) = e.key {
+                        self.claims.insert(k, idx);
+                    }
+                    changed = true;
+                }
+            }
+        }
+        Some((idx, changed))
+    }
+
     fn on_append_entries(
         &mut self,
         from: NodeId,
@@ -1073,15 +1158,13 @@ impl ReplicaCore {
         // Term fencing: refuse a stale leader with our newer term — the
         // response is what fences it (it steps down on receipt).
         if term < cur {
-            return vec![Effect::Send {
-                to: from,
-                msg: Message::AppendResponse {
-                    term: cur,
-                    success: false,
-                    last_index: self.base.index + self.durable_len,
-                    unsupported: false,
-                },
-            }];
+            return vec![Self::append_response(
+                from,
+                cur,
+                false,
+                self.base.index + self.durable_len,
+                false,
+            )];
         }
 
         // Valid leadership for `term`: recognize it. Term adoption is NOT
@@ -1107,21 +1190,8 @@ impl ReplicaCore {
         // entries are globally unique (Gate A #2) — a leader probing below
         // our base can simply fast-forward to it.
         if prev.index < self.base.index {
-            let ack = Effect::Send {
-                to: from,
-                msg: Message::AppendResponse {
-                    term,
-                    success: true,
-                    last_index: self.base.index,
-                    unsupported: false,
-                },
-            };
-            if newer {
-                effects.push(self.stage(adopted));
-                self.hold(ack);
-            } else {
-                self.hold_or(ack, &mut effects);
-            }
+            let ack = Self::append_response(from, term, true, self.base.index, false);
+            self.staged_response(adopted, newer, ack, &mut effects);
             return effects;
         }
 
@@ -1133,22 +1203,14 @@ impl ReplicaCore {
                 .entry(prev.index)
                 .is_some_and(|e| e.term.0 == prev.term);
         if !prev_ok {
-            let refusal = Effect::Send {
-                to: from,
-                msg: Message::AppendResponse {
-                    term,
-                    success: false,
-                    last_index: (self.base.index + self.durable_len)
-                        .min(prev.index.saturating_sub(1)),
-                    unsupported: false,
-                },
-            };
-            if newer {
-                effects.push(self.stage(adopted));
-                self.hold(refusal);
-            } else {
-                self.hold_or(refusal, &mut effects);
-            }
+            let refusal = Self::append_response(
+                from,
+                term,
+                false,
+                (self.base.index + self.durable_len).min(prev.index.saturating_sub(1)),
+                false,
+            );
+            self.staged_response(adopted, newer, refusal, &mut effects);
             return effects;
         }
 
@@ -1161,21 +1223,9 @@ impl ReplicaCore {
             .iter()
             .any(|e| e.activate.is_some_and(|b| self.supported & b != b))
         {
-            let refusal = Effect::Send {
-                to: from,
-                msg: Message::AppendResponse {
-                    term,
-                    success: false,
-                    last_index: self.base.index + self.durable_len,
-                    unsupported: true,
-                },
-            };
-            if newer {
-                effects.push(self.stage(adopted));
-                self.hold(refusal);
-            } else {
-                self.hold_or(refusal, &mut effects);
-            }
+            let refusal =
+                Self::append_response(from, term, false, self.base.index + self.durable_len, true);
+            self.staged_response(adopted, newer, refusal, &mut effects);
             return effects;
         }
 
@@ -1183,59 +1233,13 @@ impl ReplicaCore {
         // suffix. The committed prefix is never truncated: a conflict at or
         // below `commit` is protocol corruption — fail closed rather than
         // destroy applied history (Phase A2 turns this into quarantine).
-        let mut idx = prev.index;
-        let mut changed = false;
-        for e in &entries {
-            idx += 1;
-            match self.entry(idx) {
-                Some(existing) if *existing == *e => {}
-                Some(_) => {
-                    if idx <= self.commit {
-                        debug_assert!(false, "conflict at/below commit index — corruption");
-                        let refusal = Effect::Send {
-                            to: from,
-                            msg: Message::AppendResponse {
-                                term,
-                                success: false,
-                                last_index: self.base.index + self.durable_len,
-                                unsupported: false,
-                            },
-                        };
-                        if newer {
-                            effects.push(self.stage(adopted));
-                            self.hold(refusal);
-                        } else {
-                            self.hold_or(refusal, &mut effects);
-                        }
-                        return effects;
-                    }
-                    // The claim dies WITH its truncated entry (the atomic
-                    // unit, RFC 028 §7): remove keys owned by the removed
-                    // suffix so a re-proposed key can claim afresh.
-                    for removed in self.log.iter().skip((idx - self.base.index) as usize - 1) {
-                        if let Some(k) = removed.key {
-                            if self.claims.get(&k) >= Some(&idx) {
-                                self.claims.remove(&k);
-                            }
-                        }
-                    }
-                    self.log.truncate((idx - self.base.index) as usize - 1);
-                    self.log.push(e.clone());
-                    if let Some(k) = e.key {
-                        self.claims.insert(k, idx);
-                    }
-                    changed = true;
-                }
-                None => {
-                    self.log.push(e.clone());
-                    if let Some(k) = e.key {
-                        self.claims.insert(k, idx);
-                    }
-                    changed = true;
-                }
-            }
-        }
-        let covered = idx.max(prev.index);
+        let Some((end_idx, changed)) = self.append_or_truncate(prev.index, &entries) else {
+            let refusal =
+                Self::append_response(from, term, false, self.base.index + self.durable_len, false);
+            self.staged_response(adopted, newer, refusal, &mut effects);
+            return effects;
+        };
+        let covered = end_idx.max(prev.index);
 
         if changed || newer {
             // Durable acceptance: the success response — our quorum-
@@ -1243,31 +1247,22 @@ impl ReplicaCore {
             // of BOTH the entries and the (possibly adopted) term, staged
             // as one snapshot.
             effects.push(self.stage(adopted));
-            self.hold(Effect::Send {
-                to: from,
-                msg: Message::AppendResponse {
-                    term,
-                    success: true,
-                    last_index: if changed {
-                        covered
-                    } else {
-                        (self.base.index + self.durable_len).min(covered)
-                    },
-                    unsupported: false,
-                },
-            });
+            let last_index = if changed {
+                covered
+            } else {
+                (self.base.index + self.durable_len).min(covered)
+            };
+            self.hold(Self::append_response(from, term, true, last_index, false));
         } else {
             // Heartbeat / duplicate at the current term: durable state
             // already covers it.
-            let ack = Effect::Send {
-                to: from,
-                msg: Message::AppendResponse {
-                    term,
-                    success: true,
-                    last_index: (self.base.index + self.durable_len).min(covered),
-                    unsupported: false,
-                },
-            };
+            let ack = Self::append_response(
+                from,
+                term,
+                true,
+                (self.base.index + self.durable_len).min(covered),
+                false,
+            );
             self.hold_or(ack, &mut effects);
         }
 
