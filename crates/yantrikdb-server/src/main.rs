@@ -1547,23 +1547,14 @@ fn render_version_gauges(out: &mut String) {
     }
 }
 
-async fn run_server(cfg: ServerConfig) -> anyhow::Result<()> {
-    // Ensure data directory exists
-    std::fs::create_dir_all(&cfg.server.data_dir)?;
-
-    // RFC 017-A: install the version gauge renderer so /metrics emits
-    // wire/schema version gauges. Idempotent — set_version_gauge_renderer
-    // uses OnceLock and silently ignores subsequent calls.
-    crate::metrics::set_version_gauge_renderer(render_version_gauges);
-
-    // Deadlock detector — parking_lot's `deadlock_detection` feature lets us
-    // ask at runtime whether any cycle of thread-held locks exists. We run
-    // this every 10 seconds. If a cycle is detected we log a structured
-    // ERROR per deadlocked thread with its backtrace. This would have caught
-    // the v0.5.7/0.5.8 cognition::triggers self-deadlock in ~10 seconds
-    // instead of hours. Low overhead: parking_lot only runs the cycle check
-    // when this function is called, it does not poll or instrument locks
-    // themselves.
+/// Deadlock detector — parking_lot's `deadlock_detection` feature lets us
+/// ask at runtime whether any cycle of thread-held locks exists. Runs
+/// every 10 seconds; on a cycle logs a structured ERROR per deadlocked
+/// thread with its backtrace. Would have caught the v0.5.7/0.5.8
+/// cognition::triggers self-deadlock in ~10 seconds instead of hours.
+/// Low overhead: parking_lot only runs the cycle check when asked, it
+/// does not poll or instrument locks themselves.
+fn spawn_deadlock_detector() -> anyhow::Result<()> {
     std::thread::Builder::new()
         .name("parking-lot-deadlock-detector".into())
         .spawn(|| {
@@ -1593,19 +1584,16 @@ async fn run_server(cfg: ServerConfig) -> anyhow::Result<()> {
             }
         })?;
     tracing::info!("deadlock detector started (parking_lot::deadlock, 10s cadence)");
+    Ok(())
+}
 
-    // Open control database
-    let control = ControlDb::open(&cfg.control_db_path())?;
-
-    // Ensure default database exists
-    tenant_pool::ensure_default_database(&control, cfg.data_dir())?;
-
-    // [embedding] model_dir swaps the ONNX graph FastEmbedder loads;
-    // validate() refuses it for non-builtin strategies so a bad config
-    // fails the boot before any tenant opens.
+/// Build the server-side embedder per `[embedding]`. `validate()` first:
+/// `model_dir` is only meaningful with `strategy = "builtin"`, and a bad
+/// combination must fail the boot before any tenant opens. With builtin +
+/// model_dir the ONNX graph is loaded from the user directory (fork
+/// patch); without it, fastembed's catalog MiniLM downloads.
+fn build_embedder(cfg: &ServerConfig) -> anyhow::Result<Option<embedder::ServerEmbedder>> {
     cfg.embedding.validate()?;
-
-    // Initialize embedder based on config
     let embedder = match cfg.embedding.strategy {
         config::EmbeddingStrategy::Builtin => {
             if let Some(model_dir) = &cfg.embedding.model_dir {
@@ -1644,6 +1632,348 @@ async fn run_server(cfg: ServerConfig) -> anyhow::Result<()> {
             None
         }
     };
+    Ok(embedder)
+}
+
+/// Announce at-rest encryption state. Issue #3 (yantrikos/yantrikdb):
+/// Docker users saw NO encryption output because the tracing level hid
+/// it from `docker logs`; the stderr banner is impossible to miss.
+fn report_encryption_state(master_key: &Option<[u8; 32]>) {
+    let enc_state = if master_key.is_some() {
+        "enabled (AES-256-GCM)"
+    } else {
+        "disabled — set [encryption] section in config to enable at-rest encryption"
+    };
+    eprintln!("[yantrikdb] encryption: {enc_state}");
+    if master_key.is_some() {
+        tracing::info!("encryption: enabled (AES-256-GCM)");
+    } else {
+        tracing::warn!("encryption: disabled — set [encryption] to enable at-rest encryption");
+    }
+}
+
+/// v0.8.8: eager engine warm-up. Without it the first query against an
+/// unloaded namespace blocks for tens of seconds (HNSW reload ~10 s for
+/// a 400 MB engine) and clients with default 8 s timeouts see
+/// "transport: timeout" on a healthy server. Sequential on purpose:
+/// bounded disk contention, clean logs — acceptable for a server that
+/// runs for days (parallel via spawn_blocking for large fleets).
+fn warm_engines(control: &Arc<Mutex<ControlDb>>, pool: &Arc<tenant_pool::TenantPool>) {
+    let dbs = control.lock().list_databases().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "could not enumerate databases for warm-up");
+        Vec::new()
+    });
+    let total = dbs.len();
+    if total == 0 {
+        return;
+    }
+    tracing::info!(count = total, "warming up engines (eager load)");
+    let warm_start = std::time::Instant::now();
+    for (i, db) in dbs.iter().enumerate() {
+        let t0 = std::time::Instant::now();
+        match pool.get_engine(db) {
+            Ok(_) => tracing::info!(
+                db = %db.name,
+                progress = format!("{}/{}", i + 1, total),
+                elapsed_ms = t0.elapsed().as_millis() as u64,
+                "warmed engine"
+            ),
+            Err(e) => tracing::warn!(
+                db = %db.name,
+                error = %e,
+                "failed to warm engine — will lazy-load on first query"
+            ),
+        }
+    }
+    tracing::info!(
+        total_elapsed_ms = warm_start.elapsed().as_millis() as u64,
+        count = total,
+        "engine warm-up complete"
+    );
+}
+
+/// Legacy raft-lite cluster context. YRP mode (RFC 028) deliberately
+/// gets None: its heartbeat/election/sync loops would fight the YRP
+/// driver for write acceptance — YRP runs its own transport on the
+/// HTTP plane.
+fn build_cluster_context(
+    cfg: &ServerConfig,
+    pool: &Arc<tenant_pool::TenantPool>,
+    control: &Arc<Mutex<ControlDb>>,
+) -> anyhow::Result<Option<Arc<cluster::ClusterContext>>> {
+    if !(cfg.cluster.is_clustered() && cfg.cluster.raft_mode != crate::config::RaftClusterMode::Yrp)
+    {
+        return Ok(None);
+    }
+    let raft_path = cfg.server.data_dir.join("raft.json");
+    let node_state = Arc::new(cluster::NodeState::new(
+        cfg.cluster.node_id,
+        cfg.cluster.role,
+        raft_path,
+    )?);
+    let peer_registry = Arc::new(cluster::PeerRegistry::new(&cfg.cluster.peers));
+    let ctx = Arc::new(cluster::ClusterContext::new(
+        cfg.cluster.clone(),
+        node_state,
+        peer_registry,
+        Arc::clone(pool),
+        Some(Arc::clone(control)),
+    ));
+    tracing::info!(
+        node_id = cfg.cluster.node_id,
+        role = ?cfg.cluster.role,
+        peers = cfg.cluster.peers.len(),
+        "cluster mode enabled"
+    );
+    Ok(Some(ctx))
+}
+
+/// RFC 009 §4 Layer 1: dedicated control-plane runtime for cluster
+/// background tasks, so heartbeat/election/sync cannot be CPU-starved
+/// by HTTP/recall. Best-effort: on failure we fall back to a single
+/// runtime (warn logged) — the server still runs.
+fn build_split_runtime(
+    cluster_ctx: Option<&Arc<cluster::ClusterContext>>,
+) -> Option<crate::runtime::SplitRuntime> {
+    if cluster_ctx.is_none() {
+        return None;
+    }
+    match crate::runtime::SplitRuntime::new(crate::runtime::RuntimeConfig::default()) {
+        Ok(rt) => Some(rt),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not build split runtime; falling back to single runtime");
+            None
+        }
+    }
+}
+
+/// RFC 014-A: fail-fast on cluster-mTLS misconfiguration — prove the
+/// certs load BEFORE the cluster transport tries to use them. No-op
+/// when cluster_tls is not configured (opt-in until RFC 010 PR-4).
+async fn validate_cluster_mtls(cfg: &ServerConfig) -> anyhow::Result<()> {
+    if !cfg.cluster_tls.is_fully_specified() {
+        return Ok(());
+    }
+    match crate::security::build_acceptor(&cfg.cluster_tls) {
+        Ok(_) => tracing::info!(
+            dev_mode = cfg.cluster_tls.dev_mode,
+            "cluster mTLS acceptor: loaded successfully"
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "cluster mTLS acceptor: load FAILED");
+            anyhow::bail!("cluster mTLS misconfigured: {e}");
+        }
+    }
+    match crate::security::build_connector(&cfg.cluster_tls) {
+        Ok(_) => tracing::info!("cluster mTLS connector: loaded successfully"),
+        Err(e) => {
+            tracing::error!(error = %e, "cluster mTLS connector: load FAILED");
+            anyhow::bail!("cluster mTLS misconfigured: {e}");
+        }
+    }
+    if cfg.cluster_tls.dev_mode {
+        tracing::warn!(
+            "cluster_tls.dev_mode=true — peer cert verification SKIPPED. \
+             NEVER use in production."
+        );
+    }
+    Ok(())
+}
+
+/// Assemble the commit path per cluster mode. `Disabled` (single-node):
+/// RFC 010 PR-6.4 wraps the committer in a submitter with an Applier —
+/// without it commits would land in the log but never in the engine
+/// (RYW broken). `Yrp` (RFC 028): the driver owns consensus, the apply
+/// sink lands committed ops everywhere, YrpCommitter funnels handler
+/// writes through the replicated log; boot inspection decides
+/// healthy-vs-quarantine — the process starts either way. The openraft
+/// path was removed in Phase D (saga 239).
+fn assemble_commit_path(
+    cfg: &ServerConfig,
+    pool: &Arc<tenant_pool::TenantPool>,
+    control: &Arc<Mutex<ControlDb>>,
+    local_committer: &Arc<crate::commit::LocalSqliteCommitter>,
+) -> anyhow::Result<(
+    Arc<dyn crate::commit::MutationCommitter>,
+    Option<Arc<crate::yrp::runtime::YrpHandle>>,
+)> {
+    let engine_resolver = Arc::new(crate::tenant_pool::TenantPoolEngineResolver::new(
+        pool.clone(),
+        control.clone(),
+    )) as Arc<dyn crate::commit::EngineResolver>;
+    let applier: Arc<dyn crate::commit::Applier> =
+        Arc::new(crate::commit::EngineApplier::new(engine_resolver));
+
+    match cfg.cluster.raft_mode {
+        crate::config::RaftClusterMode::Disabled => {
+            let submitter = Arc::new(crate::commit::LocalSqliteSubmitter::new(
+                local_committer.clone(),
+                applier,
+            ));
+            Ok((submitter as Arc<dyn crate::commit::MutationCommitter>, None))
+        }
+        crate::config::RaftClusterMode::Yrp => {
+            let local: Arc<dyn crate::commit::MutationCommitter> = local_committer.clone();
+            let runtime_cfg = crate::yrp::runtime::YrpRuntimeConfig {
+                node_id: cfg.cluster.node_id as u64,
+                cluster_id: cfg.yrp.cluster_id,
+                peers: cfg
+                    .yrp
+                    .peers
+                    .iter()
+                    .map(|p| crate::yrp::runtime::YrpPeer {
+                        node_id: p.node_id,
+                        addr: p.addr.clone(),
+                        witness: p.witness,
+                    })
+                    .collect(),
+                data_dir: cfg.server.data_dir.clone(),
+                cluster_secret: cfg.cluster.cluster_secret.clone(),
+                tick_ms: cfg.yrp.tick_ms,
+                election_ticks: (cfg.yrp.election_ticks_min, cfg.yrp.election_ticks_max),
+                heartbeat_ticks: cfg.yrp.heartbeat_ticks,
+                compact_after_entries: cfg.yrp.compact_after_entries,
+                leader_retain_entries: cfg.yrp.leader_retain_entries,
+            };
+            let handle =
+                crate::yrp::runtime::spawn(runtime_cfg, local.clone(), applier, control.clone())
+                    .map_err(|e| anyhow::anyhow!("YRP assembly failed: {e}"))?;
+            tracing::info!(
+                node_id = cfg.cluster.node_id,
+                cluster_id = cfg.yrp.cluster_id,
+                peers = cfg.yrp.peers.len(),
+                "YRP assembled — YrpCommitter now driving writes (RFC 028)"
+            );
+            let committer: Arc<dyn crate::commit::MutationCommitter> = Arc::new(
+                crate::yrp::runtime::YrpCommitter::new(handle.clone(), local),
+            );
+            Ok((committer, Some(handle)))
+        }
+    }
+}
+
+/// Built-in watchdog — periodically probes the engine lock and fires a
+/// metric if acquisition takes too long. Complement to the external
+/// bash watchdog: this one runs in-process and feeds /metrics directly,
+/// while the external one captures gdb backtraces and triggers ntfy
+/// alerts.
+fn spawn_builtin_watchdog(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let pool = state.pool.clone();
+            let control = state.control.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                // Probe engine lock on default db
+                let db_record = {
+                    let ctrl = control.lock();
+                    ctrl.get_database("default").ok().flatten()
+                };
+                if let Some(rec) = db_record {
+                    if let Ok(engine) = pool.get_engine(&rec) {
+                        // v0.8.9: engine is Arc<YantrikDB> with no outer
+                        // mutex — exercise the read pool via stats() and
+                        // record probe latency as the health signal.
+                        let start = std::time::Instant::now();
+                        let _ = engine.stats(None);
+                        let elapsed = start.elapsed();
+                        crate::metrics::record_engine_lock_wait(elapsed);
+                        if elapsed >= std::time::Duration::from_secs(5) {
+                            tracing::warn!(
+                                elapsed_ms = elapsed.as_millis() as u64,
+                                "built-in watchdog: engine probe slow (>5s)"
+                            );
+                        }
+                    }
+                }
+            })
+            .await;
+        }
+    });
+    tracing::info!("built-in watchdog started (15s cadence, 5s lock timeout)");
+}
+
+/// Bind the cluster port and spawn the raft-lite background tasks.
+/// Per RFC 009 §4: when the split runtime is active, ALL cluster tasks
+/// spawn on the control runtime so HTTP/recall load can't starve them
+/// (falls back to the current runtime when isolation failed to build).
+async fn spawn_cluster_tasks(
+    cfg: &ServerConfig,
+    ctx: &Arc<cluster::ClusterContext>,
+    control_runtime_handle: &Option<tokio::runtime::Handle>,
+    cluster_cancel: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
+    let cluster_addr = format!("0.0.0.0:{}", cfg.cluster.cluster_port);
+    let cluster_listener = tokio::net::TcpListener::bind(&cluster_addr).await?;
+    tracing::info!(
+        cluster_port = cfg.cluster.cluster_port,
+        isolated_runtime = control_runtime_handle.is_some(),
+        "cluster wire server starting"
+    );
+
+    let spawn = |fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>| {
+        match control_runtime_handle.as_ref() {
+            Some(handle) => handle.spawn(fut),
+            None => tokio::spawn(fut),
+        }
+    };
+    let mut handles = Vec::new();
+
+    // Cluster server (peer-to-peer)
+    let ctx_clone = Arc::clone(ctx);
+    handles.push(spawn(Box::pin(async move {
+        if let Err(e) = cluster::server::run_cluster_server(cluster_listener, ctx_clone).await {
+            tracing::error!(error = %e, "cluster server crashed");
+        }
+    })));
+
+    // Heartbeat loop (leader sends heartbeats, followers monitor).
+    // This is the task whose scheduling latency drives the term=1423
+    // thrashing failure mode. Highest priority for CPU isolation.
+    let ctx_clone = Arc::clone(ctx);
+    let cancel_clone = cluster_cancel.clone();
+    handles.push(spawn(Box::pin(async move {
+        cluster::heartbeat::run_heartbeat_loop(ctx_clone, cancel_clone).await;
+    })));
+
+    // Oplog sync loop (followers/replicas pull from leader)
+    let ctx_clone = Arc::clone(ctx);
+    let cancel_clone = cluster_cancel.clone();
+    handles.push(spawn(Box::pin(async move {
+        cluster::sync_loop::run_sync_loop(ctx_clone, cancel_clone).await;
+    })));
+
+    // Scheduling-latency probe — spawns on the control runtime,
+    // measures the gap between when it's woken and when it runs.
+    // This is the metric `tests/cpu_isolation.rs` asserts on.
+    let cancel_clone = cluster_cancel.clone();
+    handles.push(spawn(Box::pin(async move {
+        run_scheduling_latency_probe(cancel_clone).await;
+    })));
+
+    Ok(handles)
+}
+
+async fn run_server(cfg: ServerConfig) -> anyhow::Result<()> {
+    // Ensure data directory exists
+    std::fs::create_dir_all(&cfg.server.data_dir)?;
+
+    // RFC 017-A: install the version gauge renderer so /metrics emits
+    // wire/schema version gauges. Idempotent — set_version_gauge_renderer
+    // uses OnceLock and silently ignores subsequent calls.
+    crate::metrics::set_version_gauge_renderer(render_version_gauges);
+
+    spawn_deadlock_detector()?;
+
+    // Open control database
+    let control = ControlDb::open(&cfg.control_db_path())?;
+
+    // Ensure default database exists
+    tenant_pool::ensure_default_database(&control, cfg.data_dir())?;
+
+    let embedder = build_embedder(&cfg)?;
 
     // Log ONNX Runtime version for debuggability. The 1.20.1 vs 1.24.4
     // mismatch bit us on first Proxmox deploy; having the version in the
@@ -1658,24 +1988,7 @@ async fn run_server(cfg: ServerConfig) -> anyhow::Result<()> {
     // Resolve master encryption key (auto-generates if needed)
     let master_key = cfg.encryption.resolve_key(&cfg.server.data_dir)?;
 
-    // Issue #3 (yantrikos/yantrikdb): users on Docker setups reported they
-    // saw NO encryption-related output, leaving them unable to confirm
-    // whether at-rest encryption was active. The previous tracing::info/warn
-    // depended on RUST_LOG and tracing-subscriber config, which didn't
-    // surface in their `docker logs` output. We now also write a
-    // boundary-marker banner to stderr (which Docker always captures) so
-    // the encryption state is impossible to miss at startup.
-    let enc_state = if master_key.is_some() {
-        "enabled (AES-256-GCM)"
-    } else {
-        "disabled — set [encryption] section in config to enable at-rest encryption"
-    };
-    eprintln!("[yantrikdb] encryption: {enc_state}");
-    if master_key.is_some() {
-        tracing::info!("encryption: enabled (AES-256-GCM)");
-    } else {
-        tracing::warn!("encryption: disabled — set [encryption] to enable at-rest encryption");
-    }
+    report_encryption_state(&master_key);
 
     // Create tenant pool. The background worker registry is built later
     // (just before AppState) so its maintenance loop can capture the live
@@ -1683,82 +1996,13 @@ async fn run_server(cfg: ServerConfig) -> anyhow::Result<()> {
     let pool = Arc::new(TenantPool::new(&cfg, embedder, master_key));
     let control = Arc::new(Mutex::new(control));
 
-    // v0.8.8: eager engine warm-up. A database server should serve queries
-    // at steady-state latency, not the cold-load latency of HNSW reload
-    // (~10 s for a 400 MB engine). Without this, the first query against
-    // any unloaded namespace blocks for tens of seconds — clients with
-    // default timeouts (8 s) see "transport: timeout" failures even though
-    // the server is healthy. Eager-load at startup so every database is
-    // warm before HTTP starts accepting requests.
-    //
-    // Loaded sequentially. With N databases, startup adds ~N × cold-load
-    // time. For larger fleets, switch to parallel via tokio::spawn_blocking
-    // — but sequential keeps disk I/O contention bounded and gives clean
-    // log output. Acceptable cost for a server that runs for days.
-    {
-        let dbs = control.lock().list_databases().unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "could not enumerate databases for warm-up");
-            Vec::new()
-        });
-        let total = dbs.len();
-        if total > 0 {
-            tracing::info!(count = total, "warming up engines (eager load)");
-            let warm_start = std::time::Instant::now();
-            for (i, db) in dbs.iter().enumerate() {
-                let t0 = std::time::Instant::now();
-                match pool.get_engine(db) {
-                    Ok(_) => tracing::info!(
-                        db = %db.name,
-                        progress = format!("{}/{}", i + 1, total),
-                        elapsed_ms = t0.elapsed().as_millis() as u64,
-                        "warmed engine"
-                    ),
-                    Err(e) => tracing::warn!(
-                        db = %db.name,
-                        error = %e,
-                        "failed to warm engine — will lazy-load on first query"
-                    ),
-                }
-            }
-            tracing::info!(
-                total_elapsed_ms = warm_start.elapsed().as_millis() as u64,
-                count = total,
-                "engine warm-up complete"
-            );
-        }
-    }
+    warm_engines(&control, &pool);
 
     // Initialize cluster context if clustering is enabled. YRP mode
     // (RFC 028) deliberately does NOT build the legacy raft-lite context:
     // its heartbeat/election/sync loops would fight the YRP driver for
     // write acceptance. YRP runs its own transport on the HTTP plane.
-    let cluster_ctx = if cfg.cluster.is_clustered()
-        && cfg.cluster.raft_mode != crate::config::RaftClusterMode::Yrp
-    {
-        let raft_path = cfg.server.data_dir.join("raft.json");
-        let node_state = Arc::new(cluster::NodeState::new(
-            cfg.cluster.node_id,
-            cfg.cluster.role,
-            raft_path,
-        )?);
-        let peer_registry = Arc::new(cluster::PeerRegistry::new(&cfg.cluster.peers));
-        let ctx = Arc::new(cluster::ClusterContext::new(
-            cfg.cluster.clone(),
-            node_state,
-            peer_registry,
-            Arc::clone(&pool),
-            Some(Arc::clone(&control)),
-        ));
-        tracing::info!(
-            node_id = cfg.cluster.node_id,
-            role = ?cfg.cluster.role,
-            peers = cfg.cluster.peers.len(),
-            "cluster mode enabled"
-        );
-        Some(ctx)
-    } else {
-        None
-    };
+    let cluster_ctx = build_cluster_context(&cfg, &pool, &control)?;
 
     // RFC 009 admission control: hard caps + concurrency semaphores.
     // Defaults are sized for a typical 4-core deployment. Operators tune
@@ -1779,17 +2023,7 @@ async fn run_server(cfg: ServerConfig) -> anyhow::Result<()> {
     // v0.8.2 no longer applies. Cluster control plane gets its own
     // CPU-isolated runtime; HTTP/recall stays responsive under heavy
     // openraft replication traffic.
-    let split_runtime = if cluster_ctx.is_some() {
-        match crate::runtime::SplitRuntime::new(crate::runtime::RuntimeConfig::default()) {
-            Ok(rt) => Some(rt),
-            Err(e) => {
-                tracing::warn!(error = %e, "could not build split runtime; falling back to single runtime");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let split_runtime = build_split_runtime(cluster_ctx.as_ref());
     let control_runtime_handle = split_runtime.as_ref().map(|rt| rt.control_handle());
 
     // v0.8.19 (incident 2026-05-20): wrap the rest of run_server in an
@@ -1803,36 +2037,7 @@ async fn run_server(cfg: ServerConfig) -> anyhow::Result<()> {
     // a path called post-construction. See main.rs:479-486 for the
     // original v0.8.4 documentation of this contract.
     let result: anyhow::Result<()> = (async {
-        // RFC 014-A: validate cluster-mTLS config at startup. If certs are
-        // configured, prove they load successfully BEFORE the cluster
-        // transport tries to use them — fail-fast on misconfiguration.
-        // If not configured, this is a no-op (cluster_tls is opt-in until
-        // RFC 010 PR-4 openraft mode makes it required).
-        if cfg.cluster_tls.is_fully_specified() {
-            match crate::security::build_acceptor(&cfg.cluster_tls) {
-                Ok(_) => tracing::info!(
-                    dev_mode = cfg.cluster_tls.dev_mode,
-                    "cluster mTLS acceptor: loaded successfully"
-                ),
-                Err(e) => {
-                    tracing::error!(error = %e, "cluster mTLS acceptor: load FAILED");
-                    anyhow::bail!("cluster mTLS misconfigured: {e}");
-                }
-            }
-            match crate::security::build_connector(&cfg.cluster_tls) {
-                Ok(_) => tracing::info!("cluster mTLS connector: loaded successfully"),
-                Err(e) => {
-                    tracing::error!(error = %e, "cluster mTLS connector: load FAILED");
-                    anyhow::bail!("cluster mTLS misconfigured: {e}");
-                }
-            }
-            if cfg.cluster_tls.dev_mode {
-                tracing::warn!(
-                    "cluster_tls.dev_mode=true — peer cert verification SKIPPED. \
-                     NEVER use in production."
-                );
-            }
-        }
+        validate_cluster_mtls(&cfg).await?;
 
         // RFC 010 PR-2: durable commit log substrate. SQLite-backed file
         // alongside the existing data dir. Filename pinned so backup/DR
@@ -1854,84 +2059,7 @@ async fn run_server(cfg: ServerConfig) -> anyhow::Result<()> {
         let (commit_log, yrp_handle): (
             Arc<dyn crate::commit::MutationCommitter>,
             Option<Arc<crate::yrp::runtime::YrpHandle>>,
-        ) = match cfg.cluster.raft_mode {
-            crate::config::RaftClusterMode::Disabled => {
-                // RFC 010 PR-6.4 — single-node also needs an Applier so
-                // committed mutations actually land in engine state. Without
-                // this wrapping, `commit_log.commit(...)` would write to the
-                // commit log but the engine `memories` table would never see
-                // the row — RYW broken on single-node too. Wrap
-                // `LocalSqliteCommitter` in `LocalSqliteSubmitter` (which
-                // composes committer + applier) and expose it as
-                // `Arc<dyn MutationCommitter>` via the impl in
-                // `commit/submitter.rs`.
-                let engine_resolver = Arc::new(crate::tenant_pool::TenantPoolEngineResolver::new(
-                    pool.clone(),
-                    control.clone(),
-                )) as Arc<dyn crate::commit::EngineResolver>;
-                let applier: Arc<dyn crate::commit::Applier> =
-                    Arc::new(crate::commit::EngineApplier::new(engine_resolver));
-                let submitter = Arc::new(crate::commit::LocalSqliteSubmitter::new(
-                    local_committer.clone(),
-                    applier,
-                ));
-                (submitter as Arc<dyn crate::commit::MutationCommitter>, None)
-            }
-            crate::config::RaftClusterMode::Yrp => {
-                // RFC 028: native replication. The driver owns consensus;
-                // the apply sink lands committed ops in commit-log +
-                // engine on every node; YrpCommitter funnels all handler
-                // writes through the replicated log. Boot inspection
-                // decides healthy-vs-quarantine — the process starts
-                // either way (quarantine serves diagnostics, refuses
-                // writes, retries rejoin).
-                let engine_resolver = Arc::new(crate::tenant_pool::TenantPoolEngineResolver::new(
-                    pool.clone(),
-                    control.clone(),
-                )) as Arc<dyn crate::commit::EngineResolver>;
-                let applier: Arc<dyn crate::commit::Applier> =
-                    Arc::new(crate::commit::EngineApplier::new(engine_resolver));
-                let local: Arc<dyn crate::commit::MutationCommitter> = local_committer.clone();
-                let runtime_cfg = crate::yrp::runtime::YrpRuntimeConfig {
-                    node_id: cfg.cluster.node_id as u64,
-                    cluster_id: cfg.yrp.cluster_id,
-                    peers: cfg
-                        .yrp
-                        .peers
-                        .iter()
-                        .map(|p| crate::yrp::runtime::YrpPeer {
-                            node_id: p.node_id,
-                            addr: p.addr.clone(),
-                            witness: p.witness,
-                        })
-                        .collect(),
-                    data_dir: cfg.server.data_dir.clone(),
-                    cluster_secret: cfg.cluster.cluster_secret.clone(),
-                    tick_ms: cfg.yrp.tick_ms,
-                    election_ticks: (cfg.yrp.election_ticks_min, cfg.yrp.election_ticks_max),
-                    heartbeat_ticks: cfg.yrp.heartbeat_ticks,
-                    compact_after_entries: cfg.yrp.compact_after_entries,
-                    leader_retain_entries: cfg.yrp.leader_retain_entries,
-                };
-                let handle = crate::yrp::runtime::spawn(
-                    runtime_cfg,
-                    local.clone(),
-                    applier,
-                    control.clone(),
-                )
-                .map_err(|e| anyhow::anyhow!("YRP assembly failed: {e}"))?;
-                tracing::info!(
-                    node_id = cfg.cluster.node_id,
-                    cluster_id = cfg.yrp.cluster_id,
-                    peers = cfg.yrp.peers.len(),
-                    "YRP assembled — YrpCommitter now driving writes (RFC 028)"
-                );
-                let committer: Arc<dyn crate::commit::MutationCommitter> = Arc::new(
-                    crate::yrp::runtime::YrpCommitter::new(handle.clone(), local),
-                );
-                (committer, Some(handle))
-            }
-        };
+        ) = assemble_commit_path(&cfg, &pool, &control, &local_committer)?;
 
         // RFC 010 PR-5: fault-injection registry for Jepsen runs. Empty in
         // production builds; populated via /v1/debug/fault/inject.
@@ -2017,48 +2145,7 @@ async fn run_server(cfg: ServerConfig) -> anyhow::Result<()> {
             .spawn();
         }
 
-        // Built-in watchdog — periodically probes the engine lock and fires a
-        // metric if acquisition takes too long. Complement to the external bash
-        // watchdog: this one runs in-process and feeds /metrics directly, while
-        // the external one captures gdb backtraces and triggers ntfy alerts.
-        {
-            let state_clone = Arc::clone(&state);
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    interval.tick().await;
-                    let pool = state_clone.pool.clone();
-                    let control = state_clone.control.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        // Probe engine lock on default db
-                        let db_record = {
-                            let ctrl = control.lock();
-                            ctrl.get_database("default").ok().flatten()
-                        };
-                        if let Some(rec) = db_record {
-                            if let Ok(engine) = pool.get_engine(&rec) {
-                                // v0.8.9: engine is Arc<YantrikDB> with no outer
-                                // mutex — exercise the read pool via stats() and
-                                // record probe latency as the health signal.
-                                let start = std::time::Instant::now();
-                                let _ = engine.stats(None);
-                                let elapsed = start.elapsed();
-                                crate::metrics::record_engine_lock_wait(elapsed);
-                                if elapsed >= std::time::Duration::from_secs(5) {
-                                    tracing::warn!(
-                                        elapsed_ms = elapsed.as_millis() as u64,
-                                        "built-in watchdog: engine probe slow (>5s)"
-                                    );
-                                }
-                            }
-                        }
-                    })
-                    .await;
-                }
-            });
-            tracing::info!("built-in watchdog started (15s cadence, 5s lock timeout)");
-        }
+        spawn_builtin_watchdog(Arc::clone(&state));
 
         // Build TLS acceptor if configured
         let tls_acceptor = if cfg.tls.is_enabled() {
@@ -2099,55 +2186,8 @@ async fn run_server(cfg: ServerConfig) -> anyhow::Result<()> {
         // failed to build (best-effort isolation).
         let mut cluster_handles = Vec::new();
         if let Some(ref ctx) = cluster_ctx {
-            let cluster_addr = format!("0.0.0.0:{}", cfg.cluster.cluster_port);
-            let cluster_listener = tokio::net::TcpListener::bind(&cluster_addr).await?;
-            tracing::info!(
-                cluster_port = cfg.cluster.cluster_port,
-                isolated_runtime = control_runtime_handle.is_some(),
-                "cluster wire server starting"
-            );
-
-            let spawn = |fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>| {
-                match control_runtime_handle.as_ref() {
-                    Some(handle) => handle.spawn(fut),
-                    None => tokio::spawn(fut),
-                }
-            };
-
-            // Cluster server (peer-to-peer)
-            let ctx_clone = Arc::clone(ctx);
-            cluster_handles.push(spawn(Box::pin(async move {
-                if let Err(e) =
-                    cluster::server::run_cluster_server(cluster_listener, ctx_clone).await
-                {
-                    tracing::error!(error = %e, "cluster server crashed");
-                }
-            })));
-
-            // Heartbeat loop (leader sends heartbeats, followers monitor).
-            // This is the task whose scheduling latency drives the term=1423
-            // thrashing failure mode. Highest priority for CPU isolation.
-            let ctx_clone = Arc::clone(ctx);
-            let cancel_clone = cluster_cancel.clone();
-            cluster_handles.push(spawn(Box::pin(async move {
-                cluster::heartbeat::run_heartbeat_loop(ctx_clone, cancel_clone).await;
-            })));
-
-            // Oplog sync loop (followers/replicas pull from leader)
-            let ctx_clone = Arc::clone(ctx);
-            let cancel_clone = cluster_cancel.clone();
-            cluster_handles.push(spawn(Box::pin(async move {
-                cluster::sync_loop::run_sync_loop(ctx_clone, cancel_clone).await;
-            })));
-
-            // Scheduling-latency probe — spawns on the control runtime,
-            // measures the gap between when it's woken and when it runs.
-            // This is the metric `tests/cpu_isolation.rs` asserts on.
-            // See `runtime::start_scheduling_latency_probe`.
-            let cancel_clone = cluster_cancel.clone();
-            cluster_handles.push(spawn(Box::pin(async move {
-                run_scheduling_latency_probe(cancel_clone).await;
-            })));
+            cluster_handles =
+                spawn_cluster_tasks(&cfg, ctx, &control_runtime_handle, &cluster_cancel).await?;
         }
 
         // Run both servers concurrently, shutdown on ctrl-c
