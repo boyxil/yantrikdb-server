@@ -2424,6 +2424,54 @@ async fn resolve_conflict(
     execute_cmd(engine, cmd, state.control.clone(), &state.inflight).await
 }
 
+/// Issue #82: correct an existing memory in place — POST /v1/correct.
+/// Preserves rid, created_at, and graph edges; appends a revision row.
+/// Engine contract: the embedding is NOT regenerated, so a reworded text
+/// keeps its old vector (the response says so via `embedding_updated`).
+async fn correct_memory(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> AppResult {
+    let _timer = crate::metrics::HandlerTimer::new("correct");
+    check_writable(&state)?;
+    let (_, engine) = resolve_engine(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )?;
+    let rid = body["rid"]
+        .as_str()
+        .ok_or_else(|| app_error(StatusCode::BAD_REQUEST, "missing 'rid'"))?
+        .to_string();
+    let reason = body["reason"]
+        .as_str()
+        .ok_or_else(|| app_error(StatusCode::BAD_REQUEST, "missing 'reason'"))?
+        .to_string();
+    let new_text = body.get("text").and_then(|v| v.as_str()).map(String::from);
+    let metadata_merge = body.get("metadata").cloned();
+    let new_importance = body.get("importance").and_then(|v| v.as_f64());
+    let new_valence = body.get("valence").and_then(|v| v.as_f64());
+    if new_text.is_none()
+        && metadata_merge.is_none()
+        && new_importance.is_none()
+        && new_valence.is_none()
+    {
+        return Err(app_error(
+            StatusCode::BAD_REQUEST,
+            "supply at least one of text / metadata / importance / valence",
+        ));
+    }
+    let cmd = Command::Correct {
+        rid,
+        new_text,
+        metadata_merge,
+        new_importance,
+        new_valence,
+        reason,
+    };
+    execute_cmd(engine, cmd, state.control.clone(), &state.inflight).await
+}
+
 async fn session_start(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -6819,10 +6867,6 @@ async fn trigger_prune(
 
 // ── correct (#82) — deferred (maps to UpdateMemoryPatch = NotYetWired) ─────
 
-async fn correct_deferred() -> AppResult {
-    Err(deferred_over_http("correct"))
-}
-
 /// Build the Axum router.
 #[path = "admin/ops.rs"]
 mod admin_ops;
@@ -6905,7 +6949,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/triggers/prune", post(trigger_prune))
         .route("/v1/triggers/{id}/{action}", post(trigger_lifecycle))
         // correct (#82) — global write, no replicated path yet → deferred 501
-        .route("/v1/correct", post(correct_deferred))
         .route("/v1/relate", post(relate))
         .route("/v1/claim", post(ingest_claim))
         .route("/v1/claims", get(get_claims))
@@ -6913,6 +6956,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/think", post(think))
         .route("/v1/conflicts", get(conflicts))
         .route("/v1/conflicts/{id}/resolve", post(resolve_conflict))
+        .route("/v1/correct", post(correct_memory))
         .route("/v1/sessions", post(session_start))
         .route("/v1/sessions/{id}", delete(session_end))
         .route("/v1/personality", get(personality))
@@ -7067,7 +7111,6 @@ mod issue83_parity_tests {
             (category_reset_deferred().await, "category.reset"),
             (procedure_learn_deferred().await, "procedure.learn"),
             (procedure_reinforce_deferred().await, "procedure.reinforce"),
-            (correct_deferred().await, "correct"),
         ];
         for (result, op) in cases {
             let (status, Json(body)) = result.expect_err("deferred write must be Err");
@@ -7714,7 +7757,23 @@ pub(crate) mod e2e_test_support {
             .expect("create_token");
         let control = Arc::new(Mutex::new(control));
 
-        let pool = Arc::new(crate::tenant_pool::TenantPool::new(&cfg, None, None));
+        // When the caller asks for the bundled dim, attach the bundled
+        // zero-network embedder to the POOL as well — /v1/remember and
+        // /v1/recall pre-embed through the pool (issue #19), so text-only
+        // requests work end-to-end without a server-side ONNX model.
+        let pool_embedder =
+            embedding_dim
+                .filter(|d| *d == yantrikdb::embedder::BUNDLED_EMBEDDER_DIM)
+                .map(|_| {
+                    crate::embedder::ServerEmbedder::Bundled(
+                        yantrikdb::embedder::BundledEmbedder::new(),
+                    )
+                });
+        let pool = Arc::new(crate::tenant_pool::TenantPool::new(
+            &cfg,
+            pool_embedder,
+            None,
+        ));
         let workers = crate::background::WorkerRegistry::new(
             &cfg.background,
             &cfg.maintenance,
@@ -10064,5 +10123,132 @@ mod studio_embed_tests {
                 "inline <script> in index.html: {head}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod correct_e2e {
+    //! Issue #82: POST /v1/correct against the REAL router + engine
+    //! (tests/http_integration.rs is a mock server and cannot reach
+    //! production handlers — the reason this lives in src/).
+
+    use super::e2e_test_support::{build_fixture_with_dim, get, post_body};
+
+    fn status_of(bytes: &[u8]) -> (serde_json::Value, i64, bool, bool) {
+        let v: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        (
+            v.clone(),
+            v["revision"].as_i64().unwrap_or(0),
+            v["original_tombstoned"].as_bool().unwrap_or(true),
+            v["embedding_updated"].as_bool().unwrap_or(true),
+        )
+    }
+
+    #[tokio::test]
+    async fn correct_fixes_text_in_place_and_recall_sees_it() {
+        let fx = build_fixture_with_dim("acme", yantrikdb::embedder::BUNDLED_EMBEDDER_DIM);
+        let tok = Some(fx.raw_token.as_str());
+
+        // Remember the original.
+        let (status, body) = post_body(
+            fx.state.clone(),
+            "/v1/remember",
+            tok,
+            r#"{"text": "The deploy window is Friday 14:00 UTC", "importance": 0.9}"#,
+        )
+        .await;
+        assert_eq!(
+            status,
+            200,
+            "remember failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let rid: String = {
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            v["rid"].as_str().expect("rid").to_string()
+        };
+
+        // No-op correction (reason only) → 400.
+        let (status, body) = post_body(
+            fx.state.clone(),
+            "/v1/correct",
+            tok,
+            &format!(r#"{{"rid": "{rid}", "reason": "no fields"}}"#),
+        )
+        .await;
+        assert_eq!(status, 400, "no-op must be rejected: {body:?}");
+
+        // Missing reason → 400.
+        let (status, _) = post_body(
+            fx.state.clone(),
+            "/v1/correct",
+            tok,
+            &format!(r#"{{"rid": "{rid}", "text": "x"}}"#),
+        )
+        .await;
+        assert_eq!(status, 400, "missing reason must be rejected");
+
+        // Real correction: same rid, revision bumped, no re-embed.
+        let (status, body) = post_body(
+            fx.state.clone(),
+            "/v1/correct",
+            tok,
+            &format!(
+                r#"{{"rid": "{rid}", "text": "The deploy window is Saturday 09:00 UTC", "reason": "window moved after the ops review"}}"#
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            200,
+            "correct failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let (v, revision, tombstoned, embedding_updated) = status_of(&body);
+        assert_eq!(v["rid"], serde_json::json!(rid), "rid must be preserved");
+        assert!(!tombstoned, "in-place correction never tombstones");
+        assert!(
+            !embedding_updated,
+            "engine contract: correct never re-embeds"
+        );
+        assert!(revision >= 1, "revision must be bumped, got {v}");
+
+        // Recall returns the corrected text.
+        let (status, body) = post_body(
+            fx.state.clone(),
+            "/v1/recall",
+            tok,
+            r#"{"query": "when is the deploy window", "top_k": 5}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let results = v["results"]
+            .as_array()
+            .or_else(|| v["memories"].as_array())
+            .cloned()
+            .unwrap_or_default();
+        let texts: Vec<String> = results
+            .iter()
+            .filter_map(|r| r["text"].as_str().map(String::from))
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("Saturday")),
+            "corrected text must be recallable, got {texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn correct_requires_auth() {
+        let fx = build_fixture_with_dim("acme", yantrikdb::embedder::BUNDLED_EMBEDDER_DIM);
+        let (status, _) = post_body(
+            fx.state.clone(),
+            "/v1/correct",
+            None,
+            r#"{"rid": "x", "text": "y", "reason": "z"}"#,
+        )
+        .await;
+        assert_eq!(status, 401);
+        let _ = get(fx.state.clone(), "/v1/health", None).await;
     }
 }

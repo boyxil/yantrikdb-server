@@ -385,6 +385,48 @@ pub fn execute_with_guard(
             })))
         }
 
+        Command::Correct {
+            rid,
+            new_text,
+            metadata_merge,
+            new_importance,
+            new_valence,
+            reason,
+        } => {
+            // Engine invariants (mirrored here for a clean 400 instead of
+            // an engine error): reason non-empty, at least one mutation.
+            if reason.trim().is_empty() {
+                return Err(anyhow::anyhow!("correct: 'reason' must be non-empty"));
+            }
+            if new_text.is_none()
+                && metadata_merge.is_none()
+                && new_importance.is_none()
+                && new_valence.is_none()
+            {
+                return Err(anyhow::anyhow!(
+                    "correct: supply at least one of text / metadata / importance / valence"
+                ));
+            }
+            let result = db.correct(
+                &rid,
+                new_text.as_deref(),
+                metadata_merge.as_ref(),
+                new_importance,
+                new_valence,
+                &reason,
+            )?;
+            Ok(CommandResult::Json(json!({
+                "rid": result.original_rid,
+                "corrected_rid": result.corrected_rid,
+                "original_tombstoned": result.original_tombstoned,
+                "revision": result.revision_num,
+                // Engine contract: correct() never re-embeds — a corrected
+                // text keeps its OLD vector until forget+record. Surface it
+                // so clients know recall quality may drift on reworded text.
+                "embedding_updated": false,
+            })))
+        }
+
         Command::GetClaims { entity, namespace } => {
             let claims = db.get_claims(&entity, namespace.as_deref())?;
             Ok(CommandResult::Json(json!({ "claims": claims })))

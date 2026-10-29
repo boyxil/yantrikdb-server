@@ -107,6 +107,18 @@ pub enum Command {
         new_text: Option<String>,
         resolution_note: Option<String>,
     },
+    /// Issue #82: correct an existing memory's text/metadata/scalars in
+    /// place, keeping the rid and revision history (vs forget+remember).
+    /// Mirrors the engine's `correct()` — `reason` is required and at
+    /// least one mutation field must be set; the engine rejects no-ops.
+    Correct {
+        rid: String,
+        new_text: Option<String>,
+        metadata_merge: Option<serde_json::Value>,
+        new_importance: Option<f64>,
+        new_valence: Option<f64>,
+        reason: String,
+    },
 
     // ── Claims (RFC 006 Phase 5) ────────────────────────
     GetClaims {
