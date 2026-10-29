@@ -42,7 +42,7 @@ path = "src/main.rs"
 # two statements that merely MENTION different category members are
 # not a value swap (a production deployment accumulated ~50 such false
 # conflicts; measured min side diff 17, genuine swaps are 1-3).
-yantrikdb = { version = "0.23.2", git = "https://github.com/boyxil/yantrikdb.git", rev = "54495ac05f9312cd06c417039ff13b8e8a89b71c" }
+yantrikdb = { version = "0.23.2", git = "https://github.com/boyxil/yantrikdb.git", rev = "1188b58" }
 yantrikdb-protocol = { version = "0.1.0", path = "../yantrikdb-protocol" }
 
 # Async runtime
